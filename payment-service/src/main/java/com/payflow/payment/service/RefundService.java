@@ -78,19 +78,26 @@ public class RefundService {
         refund.setReason(request.reason());
         refundOrderRepository.save(refund);
 
-        // 反向转账: 收款方 → 付款方
+        // 反向转账: 收款方 → 付款方 (freeze-then-transfer)
         try {
-            accountClient.transfer(payment.getToAccount(), payment.getFromAccount(), request.amount());
-            ledgerClient.createEntry(refund.getRefundId(),
-                    payment.getToAccount(), payment.getFromAccount(), request.amount());
+            accountClient.freezeAmount(payment.getToAccount(), request.amount());
+            try {
+                accountClient.transfer(payment.getToAccount(), payment.getFromAccount(), request.amount());
+                ledgerClient.createEntry(refund.getRefundId(),
+                        payment.getToAccount(), payment.getFromAccount(), request.amount());
 
-            refund.setStatus(RefundStatus.COMPLETED);
-            refund.setCompletedAt(Instant.now());
+                refund.setStatus(RefundStatus.COMPLETED);
+                refund.setCompletedAt(Instant.now());
 
-            // 如果全额退款, 更新原支付单状态
-            if (request.amount().equals(payment.getAmount())) {
-                payment.transitTo(PaymentStatus.REFUNDED);
-                paymentOrderRepository.save(payment);
+                // 如果全额退款, 更新原支付单状态
+                if (request.amount().equals(payment.getAmount())) {
+                    payment.transitTo(PaymentStatus.REFUNDED);
+                    paymentOrderRepository.save(payment);
+                }
+            } catch (Exception e) {
+                log.error("Refund {} failed after freeze, rolling back: {}", refund.getRefundId(), e.getMessage());
+                accountClient.unfreezeAmount(payment.getToAccount(), request.amount());
+                refund.setStatus(RefundStatus.FAILED);
             }
         } catch (Exception e) {
             log.error("Refund {} failed: {}", refund.getRefundId(), e.getMessage());
