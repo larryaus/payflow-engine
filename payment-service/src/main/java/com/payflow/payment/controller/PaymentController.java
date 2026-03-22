@@ -3,10 +3,14 @@ package com.payflow.payment.controller;
 import com.payflow.payment.domain.PaymentOrder;
 import com.payflow.payment.service.PaymentService;
 import com.payflow.payment.service.RefundService;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -35,6 +39,33 @@ public class PaymentController {
                 "payment_id", order.getPaymentId(),
                 "status", order.getStatus().name(),
                 "created_at", order.getCreatedAt().toString()
+        ));
+    }
+
+    /**
+     * 查询支付列表（分页）
+     */
+    @GetMapping
+    public ResponseEntity<Map<String, Object>> listPayments(
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int size) {
+
+        Page<PaymentOrder> result = paymentService.listPayments(page, size);
+        List<Map<String, Object>> items = result.getContent().stream()
+                .map(order -> Map.<String, Object>of(
+                        "payment_id", order.getPaymentId(),
+                        "status", order.getStatus().name(),
+                        "from_account", order.getFromAccount(),
+                        "to_account", order.getToAccount(),
+                        "amount", order.getAmount(),
+                        "currency", order.getCurrency(),
+                        "created_at", order.getCreatedAt().toString()
+                ))
+                .toList();
+
+        return ResponseEntity.ok(Map.of(
+                "data", items,
+                "total", result.getTotalElements()
         ));
     }
 

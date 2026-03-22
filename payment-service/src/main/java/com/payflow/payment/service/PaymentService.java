@@ -17,6 +17,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -143,6 +147,12 @@ public class PaymentService {
                 lock.unlock();
             }
         }
+    }
+
+    public Page<PaymentOrder> listPayments(int page, int size) {
+        // page param is 1-based from frontend, Spring Pageable is 0-based
+        PageRequest pageable = PageRequest.of(page - 1, size, Sort.by(Sort.Direction.DESC, "createdAt"));
+        return paymentOrderRepository.findAll(pageable);
     }
 
     public PaymentOrder getPayment(String paymentId) {
