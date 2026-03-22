@@ -1,75 +1,113 @@
 const express = require('express');
 const config = require('./config');
 const pool = require('./db');
+const redis = require('./redis');
 const { connectProducer, connectConsumer, consumer, disconnectKafka } = require('./kafka');
 const paymentRoutes = require('./routes/payment');
-const { errorHandler } = require('./errors');
 const paymentService = require('./services/paymentService');
+const { errorHandler } = require('./errors');
 
 const app = express();
 
+// --- Middleware ---
 app.use(express.json());
 
-// Health check
-app.get('/health', async (req, res) => {
+// --- Health Check ---
+app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok' });
-  } catch {
-    res.status(503).json({ status: 'error', message: 'Database unavailable' });
+    const redisStatus = redis.status === 'ready' ? 'up' : 'down';
+    res.json({
+      status: 'UP',
+      service: 'payment-service',
+      postgres: 'up',
+      redis: redisStatus,
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'DOWN',
+      service: 'payment-service',
+      error: err.message,
+    });
   }
 });
 
-// Routes
-app.use('/api/v1/payments', paymentRoutes);
+// --- Payment Routes ---
+app.use(paymentRoutes);
 
-// Error handler
+// --- Error Handler (must be last) ---
 app.use(errorHandler);
 
-async function startKafkaConsumer() {
-  await consumer.subscribe({ topics: ['payment.created'], fromBeginning: false });
+// --- Kafka Consumer Setup ---
+async function startConsumer() {
+  await consumer.subscribe({ topic: 'payment.created', fromBeginning: false });
 
   await consumer.run({
     eachMessage: async ({ message }) => {
       try {
-        const payload = JSON.parse(message.value.toString());
-        console.log(`Processing payment event: ${payload.payment_id}`);
-        await paymentService.processPaymentAsync(payload);
+        const paymentData = JSON.parse(message.value.toString());
+        console.log(`Received payment.created event for ${paymentData.paymentId}`);
+        await paymentService.processPaymentAsync(paymentData);
       } catch (err) {
         console.error('Error processing Kafka message:', err.message);
       }
     },
   });
+
+  console.log('Kafka consumer started — listening on payment.created');
 }
 
+// --- Graceful Shutdown ---
+function setupGracefulShutdown(server) {
+  const shutdown = async (signal) => {
+    console.log(`Received ${signal}. Shutting down gracefully...`);
+
+    server.close(async () => {
+      try {
+        await disconnectKafka();
+        await redis.quit();
+        await pool.end();
+        console.log('All connections closed');
+        process.exit(0);
+      } catch (err) {
+        console.error('Error during shutdown:', err.message);
+        process.exit(1);
+      }
+    });
+
+    // Force exit after 10 seconds
+    setTimeout(() => {
+      console.error('Forced shutdown after timeout');
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+// --- Start ---
 async function start() {
   try {
+    // Verify database connectivity
+    await pool.query('SELECT 1');
+    console.log('Connected to PostgreSQL');
+
+    // Connect Kafka producer and consumer
     await connectProducer();
     await connectConsumer();
-    await startKafkaConsumer();
+    await startConsumer();
 
-    app.listen(config.port, () => {
-      console.log(`Payment service running on port ${config.port}`);
+    // Start HTTP server
+    const server = app.listen(config.port, () => {
+      console.log(`Payment service (Node.js) listening on port ${config.port}`);
     });
+
+    setupGracefulShutdown(server);
   } catch (err) {
     console.error('Failed to start payment service:', err);
     process.exit(1);
   }
 }
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down...');
-  await disconnectKafka();
-  await pool.end();
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  console.log('Shutting down...');
-  await disconnectKafka();
-  await pool.end();
-  process.exit(0);
-});
 
 start();
