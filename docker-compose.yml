@@ -34,56 +34,70 @@ services:
     ports:
       - "9092:9092"
 
-  # ==================== Services ====================
+  # ==================== Node.js Services ====================
   payment-service:
-    build: ./payment-service
+    build: ./payment-service-node
     ports:
       - "8081:8081"
     environment:
-      SERVER_PORT: "8081"
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payflow
-      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SPRING_REDIS_HOST: redis
-      SERVICES_ACCOUNT_URL: http://account-service:8082
-      SERVICES_LEDGER_URL: http://ledger-service:8083
-      SERVICES_RISK_URL: http://risk-service:8084
+      PORT: "8081"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: payflow
+      DB_USER: payflow
+      DB_PASSWORD: payflow_secret
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      KAFKA_BROKERS: kafka:9092
+      ACCOUNT_SERVICE_URL: http://account-service:8082
+      LEDGER_SERVICE_URL: http://ledger-service:8083
+      RISK_SERVICE_URL: http://risk-service:8084
     depends_on:
       - postgres
       - redis
       - kafka
 
   account-service:
-    build: ./account-service
+    build: ./account-service-node
     ports:
       - "8082:8082"
     environment:
-      SERVER_PORT: "8082"
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payflow
-      SPRING_REDIS_HOST: redis
+      PORT: "8082"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: payflow
+      DB_USER: payflow
+      DB_PASSWORD: payflow_secret
     depends_on:
       - postgres
-      - redis
 
   ledger-service:
-    build: ./ledger-service
+    build: ./ledger-service-node
     ports:
       - "8083:8083"
     environment:
-      SERVER_PORT: "8083"
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payflow
+      PORT: "8083"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: payflow
+      DB_USER: payflow
+      DB_PASSWORD: payflow_secret
     depends_on:
       - postgres
 
   risk-service:
-    build: ./risk-service
+    build: ./risk-service-node
     ports:
       - "8084:8084"
+    environment:
+      PORT: "8084"
 
   notification-service:
-    build: ./notification-service
+    build: ./notification-service-node
     ports:
       - "8085:8085"
     environment:
+      PORT: "8085"
       KAFKA_BROKERS: kafka:9092
     depends_on:
       - kafka

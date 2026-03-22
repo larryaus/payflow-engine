@@ -1,0 +1,13 @@
+{
+  "name": "account-service",
+  "version": "1.0.0",
+  "description": "Account balance management service for PayFlow Engine",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "pg": "^8.13.0"
+  }
+}
