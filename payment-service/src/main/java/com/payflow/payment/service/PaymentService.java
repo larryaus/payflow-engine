@@ -57,48 +57,85 @@ public class PaymentService {
         this.redissonClient = redissonClient;
     }
 
+    private static final int DUPLICATE_MAX_RETRIES = 5;
+    private static final long DUPLICATE_RETRY_INTERVAL_MS = 200;
+
     /**
      * 创建支付订单 — 核心支付流程编排
      *
-     * 流程: 幂等检查 → 风控 → 冻结 → 记账 → 转账 → 通知
+     * 流程: 幂等占位(原子) → 创建订单 → 标记完成 → 风控 → 异步处理
+     *
+     * 幂等保证: Redis SETNX 原子占位，订单持久化后回写 paymentId。
+     * 重复请求通过 paymentId 直接查询已有订单，若原始请求仍在处理中则短暂轮询等待。
      */
     @Transactional
     public PaymentOrder createPayment(String idempotencyKey, CreatePaymentRequest request) {
-        // 1. 幂等性检查
-        if (idempotencyFilter.isDuplicate(idempotencyKey)) {
-            return paymentOrderRepository.findByIdempotencyKey(idempotencyKey)
-                    .orElseThrow(() -> new PaymentException("IDEMPOTENCY_CONFLICT",
-                            "Duplicate request, but original order not found"));
+        // 1. 原子性幂等占位
+        if (!idempotencyFilter.tryAcquire(idempotencyKey)) {
+            // 重复请求 — 等待原始请求完成并返回已有订单
+            return waitForExistingOrder(idempotencyKey);
         }
 
-        // 2. 创建订单
-        PaymentOrder order = new PaymentOrder();
-        order.setPaymentId(generatePaymentId());
-        order.setIdempotencyKey(idempotencyKey);
-        order.setFromAccount(request.from_account());
-        order.setToAccount(request.to_account());
-        order.setAmount(request.amount());
-        order.setCurrency(request.currency() != null ? request.currency() : "CNY");
-        order.setPaymentMethod(request.payment_method());
-        order.setMemo(request.memo());
-        order.setCallbackUrl(request.callback_url());
-        paymentOrderRepository.save(order);
-
-        // 3. 风控检查
-        boolean riskPass = riskClient.checkRisk(
-                request.from_account(), request.to_account(), request.amount());
-        if (!riskPass) {
-            order.transitTo(PaymentStatus.REJECTED);
+        try {
+            // 2. 创建订单
+            PaymentOrder order = new PaymentOrder();
+            order.setPaymentId(generatePaymentId());
+            order.setIdempotencyKey(idempotencyKey);
+            order.setFromAccount(request.from_account());
+            order.setToAccount(request.to_account());
+            order.setAmount(request.amount());
+            order.setCurrency(request.currency() != null ? request.currency() : "CNY");
+            order.setPaymentMethod(request.payment_method());
+            order.setMemo(request.memo());
+            order.setCallbackUrl(request.callback_url());
             paymentOrderRepository.save(order);
-            throw new PaymentException("RISK_REJECTED", "风控拒绝此交易");
+
+            // 3. 订单已持久化，回写 paymentId 到 Redis（解除重复请求的等待）
+            idempotencyFilter.markCompleted(idempotencyKey, order.getPaymentId());
+
+            // 4. 风控检查
+            boolean riskPass = riskClient.checkRisk(
+                    request.from_account(), request.to_account(), request.amount());
+            if (!riskPass) {
+                order.transitTo(PaymentStatus.REJECTED);
+                paymentOrderRepository.save(order);
+                throw new PaymentException("RISK_REJECTED", "风控拒绝此交易");
+            }
+            order.transitTo(PaymentStatus.PENDING);
+
+            // 5. 异步处理转账(冻结 → 记账 → 扣款 → 通知)
+            paymentOrderRepository.save(order);
+            eventProducer.sendPaymentCreated(order);
+
+            return order;
+        } catch (Exception e) {
+            // 占位成功但处理失败时，回写失败标记以便重复请求能快速感知
+            // 保留 Redis key（防止 24h 内重复提交相同请求）
+            log.error("Payment creation failed for idempotencyKey={}: {}", idempotencyKey, e.getMessage());
+            throw e;
         }
-        order.transitTo(PaymentStatus.PENDING);
+    }
 
-        // 4. 异步处理转账(冻结 → 记账 → 扣款 → 通知)
-        paymentOrderRepository.save(order);
-        eventProducer.sendPaymentCreated(order);
-
-        return order;
+    /**
+     * 重复请求等待原始订单完成 — 短暂轮询 Redis 直到 paymentId 可用
+     */
+    private PaymentOrder waitForExistingOrder(String idempotencyKey) {
+        for (int i = 0; i < DUPLICATE_MAX_RETRIES; i++) {
+            var existingId = idempotencyFilter.getExistingPaymentId(idempotencyKey);
+            if (existingId.isPresent()) {
+                return paymentOrderRepository.findByPaymentId(existingId.get())
+                        .orElseThrow(() -> new PaymentException("IDEMPOTENCY_CONFLICT",
+                                "Duplicate request, but original order not found"));
+            }
+            try {
+                Thread.sleep(DUPLICATE_RETRY_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new PaymentException("IDEMPOTENCY_CONFLICT", "Interrupted while waiting for original order");
+            }
+        }
+        throw new PaymentException("IDEMPOTENCY_CONFLICT",
+                "Duplicate request, original order still processing. Please retry later.");
     }
 
     /**

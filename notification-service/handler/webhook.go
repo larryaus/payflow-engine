@@ -22,12 +22,12 @@ func WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go sendWebhookWithRetry(callbackURL, payload)
+	go SendWebhookWithRetry(callbackURL, payload)
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// sendWebhookWithRetry 带指数退避重试的 Webhook 发送
-func sendWebhookWithRetry(url string, payload map[string]interface{}) {
+// SendWebhookWithRetry 带指数退避重试的 Webhook 发送（导出供 consumer 调用）
+func SendWebhookWithRetry(url string, payload map[string]interface{}) {
 	body, _ := json.Marshal(payload)
 	maxRetries := 3
 	backoff := 2 * time.Second

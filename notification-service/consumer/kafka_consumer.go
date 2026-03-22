@@ -1,17 +1,104 @@
 package consumer
 
-import "log"
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"os"
+	"time"
 
-// StartKafkaConsumer 启动 Kafka 消费者, 监听 payment.completed 和 payment.failed 事件
-// 实际生产中使用 segmentio/kafka-go 或 confluent-kafka-go
-func StartKafkaConsumer() {
-	log.Println("Kafka consumer started, listening on topics: payment.completed, payment.failed")
-	// 生产实现:
-	// reader := kafka.NewReader(kafka.ReaderConfig{
-	//     Brokers: []string{"kafka:9092"},
-	//     GroupID: "notification-group",
-	//     Topic:   "payment.completed",
-	// })
-	// for { msg, _ := reader.ReadMessage(ctx); handleNotification(msg) }
-	select {} // 阻塞
+	"github.com/segmentio/kafka-go"
+
+	"notification-service/handler"
+)
+
+// kafkaBroker returns the Kafka broker address from env or default.
+func kafkaBroker() string {
+	if broker := os.Getenv("KAFKA_BROKER"); broker != "" {
+		return broker
+	}
+	return "kafka:9092"
+}
+
+// StartKafkaConsumer 启动 Kafka 消费者，监听 payment.completed 和 payment.failed 事件。
+// 使用 consumer group 确保每条消息只被一个实例处理；offset 自动提交。
+func StartKafkaConsumer(ctx context.Context) {
+	topics := []string{"payment.completed", "payment.failed", "notification.send"}
+
+	for _, topic := range topics {
+		go consumeTopic(ctx, topic)
+	}
+
+	<-ctx.Done()
+	log.Println("Kafka consumer shutting down")
+}
+
+// consumeTopic 为单个 topic 创建独立的 reader，持续消费直到 ctx 取消。
+func consumeTopic(ctx context.Context, topic string) {
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        []string{kafkaBroker()},
+		GroupID:        "notification-group",
+		Topic:          topic,
+		MinBytes:       1,
+		MaxBytes:       10e6, // 10 MB
+		CommitInterval: time.Second,
+		StartOffset:    kafka.LastOffset,
+	})
+	defer func() {
+		if err := reader.Close(); err != nil {
+			log.Printf("[%s] error closing reader: %v", topic, err)
+		}
+	}()
+
+	log.Printf("[%s] consumer started", topic)
+
+	for {
+		msg, err := reader.ReadMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				// context cancelled — graceful shutdown
+				return
+			}
+			log.Printf("[%s] read error: %v, retrying in 5s", topic, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Printf("[%s] received message: partition=%d offset=%d key=%s",
+			topic, msg.Partition, msg.Offset, string(msg.Key))
+
+		handleMessage(topic, msg.Value)
+	}
+}
+
+// handleMessage 根据 topic 分发处理逻辑
+func handleMessage(topic string, value []byte) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(value, &payload); err != nil {
+		log.Printf("[%s] invalid JSON payload: %v", topic, err)
+		return
+	}
+
+	switch topic {
+	case "payment.completed", "payment.failed":
+		// 支付完成/失败 → 触发 webhook 回调
+		callbackURL, _ := payload["callback_url"].(string)
+		if callbackURL == "" {
+			log.Printf("[%s] no callback_url in payload, skipping webhook", topic)
+			return
+		}
+		handler.SendWebhookWithRetry(callbackURL, payload)
+
+	case "notification.send":
+		// 通用通知事件
+		callbackURL, _ := payload["callback_url"].(string)
+		if callbackURL == "" {
+			log.Printf("[%s] no callback_url in payload, skipping", topic)
+			return
+		}
+		handler.SendWebhookWithRetry(callbackURL, payload)
+
+	default:
+		log.Printf("unhandled topic: %s", topic)
+	}
 }
