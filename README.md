@@ -67,6 +67,7 @@
 
 | 服务名 | 职责 | 技术栈 | 端口 |
 |--------|------|--------|------|
+| `frontend` | 前端 SPA（支付管理、账户查询） | React + TypeScript + Ant Design | 3000 |
 | `api-gateway` | 统一入口、限流、鉴权、路由 | Kong / Nginx + Lua | 8080 |
 | `payment-service` | 支付核心流程（下单、查询、退款、对账） | Java Spring Boot | 8081 |
 | `account-service` | 账户管理、余额查询、冻结解冻 | Java Spring Boot | 8082 |
@@ -405,6 +406,32 @@ payflow-engine/
 │
 ├── docker-compose.yml              # 本地开发环境编排
 ├── docker-compose.infra.yml        # 基础设施(PG, Redis, Kafka, ES)
+│
+├── frontend/                       # 前端 (React + TypeScript + Ant Design)
+│   ├── package.json
+│   ├── tsconfig.json
+│   ├── vite.config.ts
+│   ├── index.html
+│   └── src/
+│       ├── main.tsx                            # 入口
+│       ├── App.tsx                             # 路由配置
+│       ├── layouts/
+│       │   └── MainLayout.tsx                  # 侧边栏布局
+│       ├── pages/
+│       │   ├── PaymentListPage.tsx             # 支付列表(分页/筛选)
+│       │   ├── PaymentCreatePage.tsx           # 发起支付表单
+│       │   ├── PaymentDetailPage.tsx           # 支付详情 + 退款
+│       │   └── AccountPage.tsx                 # 账户余额查询
+│       ├── api/
+│       │   ├── client.ts                       # Axios 实例(拦截器)
+│       │   ├── payment.ts                      # 支付 API 封装
+│       │   └── account.ts                      # 账户 API 封装
+│       ├── types/
+│       │   └── index.ts                        # TypeScript 类型定义
+│       ├── utils/
+│       │   └── format.ts                       # 金额/时间格式化
+│       └── styles/
+│           └── global.css
 │
 ├── api-gateway/                    # API 网关
 │   ├── nginx.conf
