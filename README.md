@@ -597,3 +597,191 @@ payflow-engine/
 │ 容灾:  多 AZ 部署, RPO=0, RTO<30s       │
 └─────────────────────────────────────────┘
 ```
+
+---
+
+## 9. 本地启动指南
+
+### 9.1 环境要求
+
+| 工具 | 最低版本 | 用途 |
+|------|---------|------|
+| Docker & Docker Compose | 24+ / 2.20+ | 基础设施 (PG, Redis, Kafka) |
+| Java (JDK) | 21+ | payment / account / ledger 服务 |
+| Maven | 3.9+ | Java 项目构建 |
+| Node.js | 20+ | 前端构建 |
+| Python | 3.12+ | 风控服务 |
+| Go | 1.22+ | 通知服务 |
+
+### 9.2 一键启动（推荐）
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/larryaus/payflow-engine.git
+cd payflow-engine
+
+# 2. 启动基础设施 (PostgreSQL + Redis + Kafka)
+docker-compose up -d postgres redis kafka
+
+# 3. 等待基础设施就绪 (约 10-15 秒)
+echo "Waiting for infrastructure..."
+sleep 15
+
+# 4. 验证基础设施状态
+docker-compose ps
+```
+
+### 9.3 逐个启动各服务
+
+#### 终端 1 — 风控服务 (Python)
+
+```bash
+cd risk-service
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8084 --reload
+```
+
+验证: `curl http://localhost:8084/health`
+
+#### 终端 2 — 账户服务 (Java)
+
+```bash
+cd account-service
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8082"
+```
+
+#### 终端 3 — 记账服务 (Java)
+
+```bash
+cd ledger-service
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8083"
+```
+
+#### 终端 4 — 支付服务 (Java)
+
+```bash
+cd payment-service
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8081"
+```
+
+#### 终端 5 — 通知服务 (Go)
+
+```bash
+cd notification-service
+go run main.go
+```
+
+验证: `curl http://localhost:8085/health`
+
+#### 终端 6 — 前端
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+打开浏览器访问: **http://localhost:3000**
+
+### 9.4 使用 Docker Compose 全量启动
+
+```bash
+# 一键启动所有服务 + 基础设施
+docker-compose up -d
+
+# 查看所有服务状态
+docker-compose ps
+
+# 查看某个服务日志
+docker-compose logs -f payment-service
+
+# 停止所有服务
+docker-compose down
+
+# 停止并清除数据卷 (完全重置)
+docker-compose down -v
+```
+
+### 9.5 服务端口总览
+
+启动完成后，各服务端口如下:
+
+```
+┌────────────────────────┬────────┬──────────────────────────┐
+│ 服务                    │ 端口   │ 地址                      │
+├────────────────────────┼────────┼──────────────────────────┤
+│ Frontend               │ 3000   │ http://localhost:3000     │
+│ API Gateway            │ 8080   │ http://localhost:8080     │
+│ Payment Service        │ 8081   │ http://localhost:8081     │
+│ Account Service        │ 8082   │ http://localhost:8082     │
+│ Ledger Service         │ 8083   │ http://localhost:8083     │
+│ Risk Service           │ 8084   │ http://localhost:8084     │
+│ Notification Service   │ 8085   │ http://localhost:8085     │
+├────────────────────────┼────────┼──────────────────────────┤
+│ PostgreSQL             │ 5432   │ localhost:5432            │
+│ Redis                  │ 6379   │ localhost:6379            │
+│ Kafka                  │ 9092   │ localhost:9092            │
+└────────────────────────┴────────┴──────────────────────────┘
+```
+
+### 9.6 快速验证
+
+```bash
+# 1. 健康检查
+curl http://localhost:8084/health        # Risk Service
+curl http://localhost:8085/health        # Notification Service
+
+# 2. 创建支付订单
+curl -X POST http://localhost:8081/api/v1/payments \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+    "from_account": "ACC_001",
+    "to_account": "ACC_002",
+    "amount": 10000,
+    "currency": "CNY",
+    "payment_method": "BANK_TRANSFER",
+    "memo": "测试支付"
+  }'
+
+# 3. 查询支付状态
+curl http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX
+
+# 4. 查询账户余额
+curl http://localhost:8082/api/v1/accounts/ACC_001/balance
+
+# 5. 发起退款
+curl -X POST http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX/refund \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{
+    "amount": 5000,
+    "reason": "测试退款"
+  }'
+```
+
+### 9.7 数据库连接
+
+```bash
+# 连接 PostgreSQL
+psql -h localhost -U payflow -d payflow
+# 密码: payflow_secret
+
+# 查看已创建的表
+\dt
+
+# 连接 Redis
+redis-cli -h localhost -p 6379
+```
+
+### 9.8 常见问题
+
+| 问题 | 解决方案 |
+|------|---------|
+| 端口被占用 | `lsof -i :PORT` 找到进程并 kill，或修改配置中的端口 |
+| Kafka 启动失败 | 确保 Docker 分配了足够内存 (建议 >= 4GB) |
+| Java 服务连不上 PG | 确认 PostgreSQL 已完全启动: `docker-compose logs postgres` |
+| 前端 API 请求 404 | 确认 vite proxy 指向正确的网关端口，或直连后端服务 |
+| Maven 下载慢 | 配置 `~/.m2/settings.xml` 使用阿里云镜像源 |
