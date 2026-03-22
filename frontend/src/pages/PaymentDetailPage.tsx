@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Descriptions, Tag, Card, Button, Modal, InputNumber, Input, message, Spin, Steps } from 'antd';
-import { getPayment, refundPayment } from '../api/payment';
-import type { PaymentOrder, PaymentStatus } from '../types';
+import { Descriptions, Tag, Card, Button, Modal, InputNumber, Input, message, Spin, Steps, Table } from 'antd';
+import { getPayment, refundPayment, listRefunds } from '../api/payment';
+import type { PaymentOrder, PaymentStatus, RefundOrder } from '../types';
 import { formatAmount, formatTime, statusConfig } from '../utils/format';
 
 const statusSteps: PaymentStatus[] = ['CREATED', 'PENDING', 'PROCESSING', 'COMPLETED'];
@@ -12,6 +12,7 @@ function PaymentDetailPage() {
   const navigate = useNavigate();
   const [order, setOrder] = useState<PaymentOrder | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refunds, setRefunds] = useState<RefundOrder[]>([]);
   const [refundVisible, setRefundVisible] = useState(false);
   const [refundAmount, setRefundAmount] = useState<number>(0);
   const [refundReason, setRefundReason] = useState('');
@@ -20,8 +21,12 @@ function PaymentDetailPage() {
     if (!paymentId) return;
     setLoading(true);
     try {
-      const data = await getPayment(paymentId);
+      const [data, refundData] = await Promise.all([
+        getPayment(paymentId),
+        listRefunds(paymentId),
+      ]);
       setOrder(data);
+      setRefunds(refundData);
     } catch {
       message.error('加载支付详情失败');
     } finally {
@@ -99,6 +104,43 @@ function PaymentDetailPage() {
           </Descriptions.Item>
         </Descriptions>
       </Card>
+
+      {refunds.length > 0 && (
+        <Card title="退款记录" style={{ marginTop: 24 }}>
+          <Table
+            rowKey="refund_id"
+            dataSource={refunds}
+            pagination={false}
+            columns={[
+              { title: '退款单号', dataIndex: 'refund_id' },
+              {
+                title: '金额',
+                dataIndex: 'amount',
+                render: (v: number) => `${formatAmount(v)} CNY`,
+              },
+              {
+                title: '状态',
+                dataIndex: 'status',
+                render: (s: string) => {
+                  const color = s === 'COMPLETED' ? 'green' : s === 'FAILED' ? 'red' : 'blue';
+                  return <Tag color={color}>{s}</Tag>;
+                },
+              },
+              { title: '原因', dataIndex: 'reason' },
+              {
+                title: '创建时间',
+                dataIndex: 'created_at',
+                render: (v: string) => formatTime(v),
+              },
+              {
+                title: '完成时间',
+                dataIndex: 'completed_at',
+                render: (v?: string) => (v ? formatTime(v) : '-'),
+              },
+            ]}
+          />
+        </Card>
+      )}
 
       <Modal
         title="发起退款"

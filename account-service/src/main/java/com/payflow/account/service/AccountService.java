@@ -5,6 +5,8 @@ import com.payflow.account.repository.AccountRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
+
 @Service
 public class AccountService {
 
@@ -12,6 +14,10 @@ public class AccountService {
 
     public AccountService(AccountRepository accountRepository) {
         this.accountRepository = accountRepository;
+    }
+
+    public List<Account> listAccounts() {
+        return accountRepository.findAll();
     }
 
     public Account getAccount(String accountId) {
