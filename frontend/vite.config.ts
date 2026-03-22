@@ -12,6 +12,14 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
+      '/api/v1/accounts': {
+        target: 'http://localhost:8082',
+        changeOrigin: true,
+      },
+      '/api/v1/risk': {
+        target: 'http://localhost:8084',
+        changeOrigin: true,
+      },
       '/api': {
         target: 'http://localhost:8081',
         changeOrigin: true,
