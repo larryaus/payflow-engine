@@ -1,0 +1,57 @@
+# ==================== General ====================
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*.swo
+*~
+
+# ==================== IDE ====================
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# ==================== Java / Spring Boot ====================
+target/
+build/
+*.jar
+*.war
+*.class
+!gradle-wrapper.jar
+.gradle/
+
+# ==================== Node / Frontend ====================
+node_modules/
+dist/
+.cache/
+.parcel-cache/
+*.tsbuildinfo
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# ==================== Go ====================
+/notification-service/notification-service
+
+# ==================== Docker ====================
+docker-compose.override.yml
+
+# ==================== Environment / Secrets ====================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
