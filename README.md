@@ -4,61 +4,48 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Client Layer                                   │
-│         Web App / Mobile App / Third-Party Partners (SDK/API)               │
+│                              Client (Browser)                               │
 └──────────────────────────────┬──────────────────────────────────────────────┘
-                               │ HTTPS / gRPC
+                               │ HTTP
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           API Gateway (Kong/Nginx)                          │
-│   ┌──────────┐  ┌──────────────┐  ┌───────────┐  ┌──────────────────┐      │
-│   │ 限流/熔断 │  │ JWT Auth     │  │ 路由分发   │  │ 请求日志/链路追踪 │      │
-│   │ Rate Limit│  │ Token验证    │  │ Routing   │  │ Tracing          │      │
-│   └──────────┘  └──────────────┘  └───────────┘  └──────────────────┘      │
-└──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
-            ┌──────────────────┼──────────────────────┐
-            ▼                  ▼                       ▼
-┌──────────────────┐ ┌──────────────────┐  ┌──────────────────────┐
-│  Payment Service │ │  Account Service │  │  Notification Service│
-│  (支付核心服务)    │ │  (账户服务)       │  │  (通知服务)           │
-│                  │ │                  │  │                      │
-│ - 支付下单       │ │ - 账户余额查询    │  │ - 支付结果通知        │
-│ - 支付状态查询   │ │ - 账户冻结/解冻   │  │ - SMS / Email / Push │
-│ - 退款处理       │ │ - KYC 验证       │  │ - Webhook 回调       │
-│ - 对账           │ │ - 风控检查       │  │                      │
-└────────┬─────────┘ └────────┬─────────┘  └──────────────────────┘
-         │                    │
-         ▼                    ▼
-┌──────────────────┐ ┌──────────────────┐
-│ Ledger Service   │ │  Risk Service    │
-│ (记账/分录服务)   │ │  (风控服务)       │
-│                  │ │                  │
-│ - 复式记账       │ │ - 规则引擎       │
-│ - 事务一致性     │ │ - 黑名单检查     │
-│ - 余额计算       │ │ - 异常检测(ML)   │
-│ - 日终对账       │ │ - 限额管理       │
-└────────┬─────────┘ └──────────────────┘
+│                    Frontend — Nginx (port 3000 / 80)                        │
+│   ┌──────────────────────┐  ┌────────────────────────────────────────┐      │
+│   │ 静态资源 (React SPA)  │  │ 反向代理 + 限流 (10r/s per IP, burst=20)│      │
+│   └──────────────────────┘  └────────────────────────────────────────┘      │
+└──────────┬──────────────────────────────┬───────────────────────────────────┘
+           │ /api/v1/payments             │ /api/v1/accounts
+           ▼                              ▼
+┌──────────────────┐          ┌──────────────────┐  ┌──────────────────────┐
+│  Payment Service │          │  Account Service │  │  Notification Service│
+│  (支付核心服务)   │          │  (账户服务)       │  │  (通知服务)           │
+│                  │          │                  │  │                      │
+│ - 支付下单       │          │ - 账户余额查询    │  │ - Webhook 回调       │
+│ - 支付状态查询   │          │ - 账户冻结/解冻   │  │                      │
+│ - 退款处理       │          │ - 转账           │  │                      │
+└────────┬─────────┘          └──────────────────┘  └──────────────────────┘
+         │ (sync Feign)
+         ├──────────────────> Risk Service (风控规则引擎)
+         │                    - 黑名单检查 / 限额管理
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         Message Queue (Kafka)                               │
-│                                                                             │
 │  Topics: payment.created | payment.completed | payment.failed               │
-│          ledger.entry    | notification.send | risk.alert                    │
+│          ledger.entry    | notification.send | risk.alert                   │
 └──────────────────────────────┬──────────────────────────────────────────────┘
                                │
          ┌─────────────────────┼─────────────────────┐
          ▼                     ▼                      ▼
-┌──────────────────┐  ┌──────────────┐  ┌───────────────────┐
-│  PostgreSQL      │  │  Redis       │  │  Elasticsearch    │
-│  (主数据库)       │  │  (缓存/锁)    │  │  (日志/审计)       │
-│                  │  │              │  │                   │
-│ - 支付订单表     │  │ - 幂等性控制  │  │ - 交易日志        │
-│ - 账户表         │  │ - 分布式锁   │  │ - 审计追踪        │
-│ - 分录表         │  │ - 限流计数器  │  │ - 报表查询        │
-│ - 对账表         │  │ - Session    │  │                   │
-└──────────────────┘  └──────────────┘  └───────────────────┘
+┌──────────────────┐  ┌──────────────┐  ┌──────────────────────┐
+│  PostgreSQL      │  │  Redis       │  │  Ledger Service      │
+│  (主数据库)       │  │  (缓存/锁)   │  │  (记账/分录服务)      │
+│                  │  │              │  │                      │
+│ - 支付订单表     │  │ - 幂等性控制  │  │ - 复式记账           │
+│ - 账户表         │  │ - 分布式锁   │  │ - 事务一致性         │
+│ - 分录表         │  │              │  │                      │
+│ - 退款表         │  │              │  │                      │
+└──────────────────┘  └──────────────┘  └──────────────────────┘
 ```
 
 ---
@@ -67,14 +54,12 @@
 
 | 服务名 | 职责 | 技术栈 | 端口 |
 |--------|------|--------|------|
-| `frontend` | 前端 SPA（支付管理、账户查询） | React + TypeScript + Ant Design | 3000 |
-| `api-gateway` | 统一入口、限流、鉴权、路由 | Kong / Nginx + Lua | 8080 |
-| `payment-service` | 支付核心流程（下单、查询、退款、对账） | Java Spring Boot | 8081 |
-| `account-service` | 账户管理、余额查询、冻结解冻 | Java Spring Boot | 8082 |
-| `ledger-service` | 复式记账、分录管理、余额一致性 | Java Spring Boot | 8083 |
-| `risk-service` | 风控规则引擎、黑名单、限额 | Python FastAPI | 8084 |
-| `notification-service` | 消息通知（SMS/Email/Webhook） | Go | 8085 |
-| `reconciliation-service` | 日终对账、差异处理 | Java Spring Boot | 8086 |
+| `frontend` | 前端 SPA + Nginx 反向代理（限流 10r/s per IP） | React + TypeScript + Ant Design + Nginx | 3000 |
+| `payment-service` | 支付核心流程（下单、查询、退款） | Java 21 + Spring Boot 3 | 8081 |
+| `account-service` | 账户管理、余额查询、冻结解冻、转账 | Java 21 + Spring Boot 3 | 8082 |
+| `ledger-service` | 复式记账、分录管理 | Java 21 + Spring Boot 3 | 8083 |
+| `risk-service` | 风控规则引擎、黑名单、限额 | Python 3.12 + FastAPI | 8084 |
+| `notification-service` | Webhook 回调通知 | Go 1.22 | 8085 |
 
 ---
 
@@ -165,13 +150,16 @@ Response 200:
 ## 4. Payment Flow (支付流程)
 
 ```
-Client                Gateway         PaymentSvc      RiskSvc       AccountSvc      LedgerSvc       Kafka         NotifySvc
+Client             Nginx(frontend)    PaymentSvc      RiskSvc       AccountSvc      LedgerSvc       Kafka         NotifySvc
   │                     │                │               │              │               │              │              │
   │  POST /payments     │                │               │              │               │              │              │
   │────────────────────>│                │               │              │               │              │              │
-  │                     │  幂等性检查     │               │              │               │              │              │
-  │                     │  (Redis)       │               │              │               │              │              │
+  │                     │  限流检查       │               │              │               │              │              │
+  │                     │  (10r/s)       │               │              │               │              │              │
+  │                     │  proxy_pass   │               │              │               │              │              │
   │                     │───────────────>│               │              │               │              │              │
+  │                     │                │  幂等性检查    │              │               │              │              │
+  │                     │                │  (Redis SETNX)│              │               │              │              │
   │                     │                │               │              │               │              │              │
   │                     │                │  1.风控检查    │              │               │              │              │
   │                     │                │──────────────>│              │               │              │              │
@@ -183,25 +171,18 @@ Client                Gateway         PaymentSvc      RiskSvc       AccountSvc  
   │                     │                │  freeze: OK                  │               │              │              │
   │                     │                │<─────────────────────────────│               │              │              │
   │                     │                │               │              │               │              │              │
-  │                     │                │  3.创建分录(复式记账)          │               │              │              │
-  │                     │                │─────────────────────────────────────────────>│              │              │
-  │                     │                │  ledger: OK                                  │              │              │
-  │                     │                │<─────────────────────────────────────────────│              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  4.解冻 + 扣款/入账           │               │              │              │
-  │                     │                │─────────────────────────────>│               │              │              │
-  │                     │                │  transfer: OK                │               │              │              │
-  │                     │                │<─────────────────────────────│               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  5.发布事件 payment.completed │               │              │              │
+  │                     │                │  3.发布事件 payment.created   │               │              │              │
   │                     │                │────────────────────────────────────────────────────────────>│              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │               │              │               │              │  6.通知回调   │
-  │                     │                │               │              │               │              │─────────────>│
-  │                     │                │               │              │               │              │              │──> Webhook
   │  202 Accepted       │                │               │              │               │              │              │
   │<────────────────────│                │               │              │               │              │              │
   │                     │                │               │              │               │              │              │
+  │                     │ (async)        │               │              │               │              │              │
+  │                     │                │               │              │  4.复式记账    │<─────────────│              │
+  │                     │                │               │              │               │              │              │
+  │                     │                │               │  5.解冻+转账  │               │<─────────────│              │
+  │                     │                │               │              │               │              │              │
+  │                     │                │               │              │               │              │─────────────>│
+  │                     │                │               │              │               │              │  6.Webhook   │──> callback
 ```
 
 ### 4.1 支付状态机
@@ -280,17 +261,18 @@ public PaymentResult processPayment(PaymentRequest req) {
 
 ### 5.3 限流策略
 
-```
-API Gateway 层:
-├── 全局限流: 令牌桶算法, 10000 QPS
-├── 用户级限流: 滑动窗口, 100 次/分钟
-└── IP 级限流: 固定窗口, 1000 次/分钟
+```nginx
+# frontend/nginx.conf — Nginx 漏桶算法
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
 
-Service 层:
-├── Sentinel 熔断降级
-├── 线程池隔离(每个下游服务独立线程池)
-└── 超时控制: 支付链路总超时 30s
+# 应用于 /api/v1/payments 和 /api/v1/accounts
+limit_req zone=api_limit burst=20 nodelay;
+limit_req_status 429;
 ```
+
+- **rate=10r/s**：每个客户端 IP 每秒最多 10 个请求
+- **burst=20**：允许瞬间突发 20 个请求，超出直接返回 429
+- **zone 10m**：共享内存 10MB，可追踪约 16 万个 IP
 
 ### 5.4 数据库层优化
 
@@ -403,11 +385,12 @@ CREATE TABLE refund_order (
 payflow-engine/
 │
 ├── README.md
-│
-├── docker-compose.yml              # 本地开发环境编排
-├── docker-compose.infra.yml        # 基础设施(PG, Redis, Kafka, ES)
+├── CLAUDE.md                       # AI 助手指南
+├── docker-compose.yml              # 全栈本地编排
 │
 ├── frontend/                       # 前端 (React + TypeScript + Ant Design)
+│   ├── nginx.conf                  # 静态托管 + 反向代理 + IP 限流
+│   ├── Dockerfile
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── vite.config.ts
@@ -433,58 +416,54 @@ payflow-engine/
 │       └── styles/
 │           └── global.css
 │
-├── api-gateway/                    # API 网关
-│   ├── nginx.conf
-│   └── rate-limit.lua              # 限流脚本
-│
 ├── payment-service/                # 支付核心服务 (Java Spring Boot)
 │   ├── pom.xml
+│   ├── Dockerfile
 │   └── src/main/java/com/payflow/payment/
 │       ├── PaymentApplication.java
 │       ├── controller/
 │       │   └── PaymentController.java          # REST API 入口
 │       ├── service/
 │       │   ├── PaymentService.java             # 支付编排(主流程)
-│       │   ├── PaymentStateMachine.java        # 状态机管理
 │       │   └── RefundService.java              # 退款逻辑
 │       ├── domain/
 │       │   ├── PaymentOrder.java               # 支付订单实体
-│       │   ├── PaymentStatus.java              # 状态枚举
-│       │   └── RefundOrder.java                # 退款实体
+│       │   ├── PaymentStatus.java              # 状态枚举(含状态机)
+│       │   ├── RefundOrder.java                # 退款实体
+│       │   └── RefundStatus.java               # 退款状态枚举
 │       ├── repository/
-│       │   ├── PaymentOrderRepository.java     # 数据访问层
+│       │   ├── PaymentOrderRepository.java
 │       │   └── RefundOrderRepository.java
 │       ├── client/
-│       │   ├── AccountClient.java              # 调用 account-service
-│       │   ├── RiskClient.java                 # 调用 risk-service
-│       │   └── LedgerClient.java               # 调用 ledger-service
+│       │   ├── AccountClient.java              # Feign → account-service
+│       │   ├── RiskClient.java                 # Feign → risk-service
+│       │   └── LedgerClient.java               # Feign → ledger-service
 │       ├── mq/
 │       │   ├── PaymentEventProducer.java       # Kafka 生产者
 │       │   └── PaymentEventConsumer.java       # Kafka 消费者
 │       ├── config/
-│       │   ├── RedisConfig.java
-│       │   ├── KafkaConfig.java
-│       │   └── IdempotencyFilter.java          # 幂等性拦截器
+│       │   └── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
 │       └── exception/
 │           ├── PaymentException.java
 │           └── GlobalExceptionHandler.java
 │
 ├── account-service/                # 账户服务 (Java Spring Boot)
 │   ├── pom.xml
+│   ├── Dockerfile
 │   └── src/main/java/com/payflow/account/
 │       ├── AccountApplication.java
 │       ├── controller/
-│       │   └── AccountController.java
+│       │   └── AccountController.java          # freeze / unfreeze / transfer / balance
 │       ├── service/
-│       │   ├── AccountService.java             # 余额操作
-│       │   └── FreezeService.java              # 冻结/解冻
+│       │   └── AccountService.java             # 余额操作、冻结解冻、分布式锁
 │       ├── domain/
-│       │   └── Account.java
+│       │   └── Account.java                    # @Version 乐观锁
 │       └── repository/
 │           └── AccountRepository.java
 │
 ├── ledger-service/                 # 记账服务 (Java Spring Boot)
 │   ├── pom.xml
+│   ├── Dockerfile
 │   └── src/main/java/com/payflow/ledger/
 │       ├── LedgerApplication.java
 │       ├── controller/
@@ -497,61 +476,28 @@ payflow-engine/
 │           └── LedgerEntryRepository.java
 │
 ├── risk-service/                   # 风控服务 (Python FastAPI)
+│   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── main.py
-│   ├── rules/
-│   │   ├── rule_engine.py                      # 规则引擎
-│   │   ├── blacklist.py                        # 黑名单检查
-│   │   └── amount_limit.py                     # 限额规则
-│   └── models/
-│       └── anomaly_detector.py                 # ML 异常检测
+│   ├── main.py                                 # FastAPI 入口
+│   └── rules/
+│       ├── rule_engine.py                      # 责任链编排
+│       ├── blacklist.py                        # 黑名单检查
+│       └── amount_limit.py                     # 限额规则
 │
 ├── notification-service/           # 通知服务 (Go)
+│   ├── Dockerfile
 │   ├── go.mod
 │   ├── main.go
 │   ├── handler/
-│   │   ├── webhook.go                          # Webhook 回调
-│   │   ├── sms.go                              # 短信通知
-│   │   └── email.go                            # 邮件通知
+│   │   └── webhook.go                          # Webhook 回调
 │   └── consumer/
 │       └── kafka_consumer.go                   # 消费 Kafka 事件
 │
-├── reconciliation-service/         # 对账服务 (Java Spring Boot)
-│   ├── pom.xml
-│   └── src/main/java/com/payflow/recon/
-│       ├── ReconApplication.java
-│       └── service/
-│           ├── ReconService.java               # 对账逻辑
-│           └── DiffHandler.java                # 差异处理
-│
-├── common/                         # 公共模块
-│   ├── proto/                      # gRPC Protobuf 定义
-│   │   ├── payment.proto
-│   │   ├── account.proto
-│   │   └── ledger.proto
-│   └── shared/
-│       ├── ErrorCode.java                      # 统一错误码
-│       ├── ApiResponse.java                    # 统一响应格式
-│       └── SnowflakeIdGenerator.java           # 分布式 ID 生成
-│
-├── deploy/                         # 部署配置
-│   ├── k8s/
-│   │   ├── payment-deployment.yaml
-│   │   ├── account-deployment.yaml
-│   │   └── ingress.yaml
-│   └── helm/
-│       └── payflow-chart/
-│
-├── sql/                            # 数据库初始化脚本
-│   ├── 001_create_payment_order.sql
-│   ├── 002_create_account.sql
-│   ├── 003_create_ledger_entry.sql
-│   └── 004_create_refund_order.sql
-│
-└── docs/                           # 文档
-    ├── api-spec.yaml               # OpenAPI 3.0 规范
-    ├── architecture.md             # 架构详细文档
-    └── runbook.md                  # 运维手册
+└── sql/                            # 数据库初始化脚本(容器启动时自动执行)
+    ├── 001_create_payment_order.sql
+    ├── 002_create_account.sql
+    ├── 003_create_ledger_entry.sql
+    └── 004_create_refund_order.sql
 ```
 
 ---
@@ -709,21 +655,20 @@ docker-compose down -v
 启动完成后，各服务端口如下:
 
 ```
-┌────────────────────────┬────────┬──────────────────────────┐
-│ 服务                    │ 端口   │ 地址                      │
-├────────────────────────┼────────┼──────────────────────────┤
-│ Frontend               │ 3000   │ http://localhost:3000     │
-│ API Gateway            │ 8080   │ http://localhost:8080     │
-│ Payment Service        │ 8081   │ http://localhost:8081     │
-│ Account Service        │ 8082   │ http://localhost:8082     │
-│ Ledger Service         │ 8083   │ http://localhost:8083     │
-│ Risk Service           │ 8084   │ http://localhost:8084     │
-│ Notification Service   │ 8085   │ http://localhost:8085     │
-├────────────────────────┼────────┼──────────────────────────┤
-│ PostgreSQL             │ 5432   │ localhost:5432            │
-│ Redis                  │ 6379   │ localhost:6379            │
-│ Kafka                  │ 9092   │ localhost:9092            │
-└────────────────────────┴────────┴──────────────────────────┘
+┌──────────────────────────────────┬────────┬──────────────────────────┐
+│ 服务                              │ 端口   │ 地址                      │
+├──────────────────────────────────┼────────┼──────────────────────────┤
+│ Frontend (Nginx + React SPA)     │ 3000   │ http://localhost:3000     │
+│ Payment Service                  │ 8081   │ http://localhost:8081     │
+│ Account Service                  │ 8082   │ http://localhost:8082     │
+│ Ledger Service                   │ 8083   │ http://localhost:8083     │
+│ Risk Service                     │ 8084   │ http://localhost:8084     │
+│ Notification Service             │ 8085   │ http://localhost:8085     │
+├──────────────────────────────────┼────────┼──────────────────────────┤
+│ PostgreSQL                       │ 5432   │ localhost:5432            │
+│ Redis                            │ 6379   │ localhost:6379            │
+│ Kafka                            │ 9092   │ localhost:9092            │
+└──────────────────────────────────┴────────┴──────────────────────────┘
 ```
 
 ### 9.6 快速验证
