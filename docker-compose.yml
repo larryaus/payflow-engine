@@ -40,13 +40,12 @@ services:
     ports:
       - "8081:8081"
     environment:
-      SERVER_PORT: "8081"
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payflow
-      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SPRING_REDIS_HOST: redis
-      SERVICES_ACCOUNT_URL: http://account-service:8082
-      SERVICES_LEDGER_URL: http://ledger-service:8083
-      SERVICES_RISK_URL: http://risk-service:8084
+      DATABASE_URL: postgresql://payflow:payflow_secret@postgres:5432/payflow
+      KAFKA_BROKERS: kafka:9092
+      REDIS_HOST: redis
+      ACCOUNT_SERVICE_URL: http://account-service:8082
+      LEDGER_SERVICE_URL: http://ledger-service:8083
+      RISK_SERVICE_URL: http://risk-service:8084
     depends_on:
       - postgres
       - redis
@@ -57,20 +56,16 @@ services:
     ports:
       - "8082:8082"
     environment:
-      SERVER_PORT: "8082"
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payflow
-      SPRING_REDIS_HOST: redis
+      DATABASE_URL: postgresql://payflow:payflow_secret@postgres:5432/payflow
     depends_on:
       - postgres
-      - redis
 
   ledger-service:
     build: ./ledger-service
     ports:
       - "8083:8083"
     environment:
-      SERVER_PORT: "8083"
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payflow
+      DATABASE_URL: postgresql://payflow:payflow_secret@postgres:5432/payflow
     depends_on:
       - postgres
 
