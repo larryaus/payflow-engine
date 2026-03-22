@@ -1,6 +1,5 @@
 import apiClient from './client';
 import type { PaymentOrder, CreatePaymentRequest, RefundRequest } from '../types';
-import { v4 as uuidv4 } from 'crypto';
 
 /**
  * 生成幂等键
