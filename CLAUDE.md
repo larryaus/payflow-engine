@@ -21,6 +21,8 @@ Six services communicate via REST (sync) and Kafka (async):
 
 **Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6), Nginx
 
+**Rate limiting:** Nginx (`frontend/nginx.conf`) — `limit_req_zone` 10r/s per IP, burst=20, applies to all `/api/*` routes, returns 429 on exceed.
+
 ### Payment Flow (Sync → Async)
 ```
 Client → Payment Service → Redis (idempotency check) → Risk Service (sync)
@@ -63,7 +65,8 @@ payflow-engine/
 │   ├── main.go               # HTTP server entry
 │   ├── consumer/             # Kafka consumer
 │   └── handler/              # Webhook delivery
-├── frontend/                 # React + TypeScript SPA
+├── frontend/                 # React + TypeScript SPA + Nginx
+│   ├── nginx.conf            # Static hosting + reverse proxy + rate limiting
 │   └── src/
 │       ├── pages/            # PaymentListPage, PaymentCreatePage, PaymentDetailPage, AccountPage
 │       ├── layouts/          # MainLayout (navigation)
@@ -78,7 +81,7 @@ payflow-engine/
 ├── .github/workflows/        # CI (ci.yml) and CD (cd.yml) workflows
 ├── .husky/                   # Git hooks (pre-commit linting)
 ├── docker-compose.yml        # Full stack local orchestration
-└── README.md                 # Architecture deep-dive (788 lines)
+└── README.md                 # Architecture deep-dive
 ```
 
 ---
@@ -178,6 +181,12 @@ go build ./...
 
 - **Style:** Standard Go conventions — exported functions PascalCase, unexported camelCase
 - **Kafka consumption:** Handled in `consumer/kafka_consumer.go`
+- **Webhook only:** Only `handler/webhook.go` exists — no SMS/email handlers
+
+### Nginx (Frontend)
+
+- **Config:** `frontend/nginx.conf` — handles static files and reverse proxy
+- **Rate limiting:** `limit_req_zone` on `/api/v1/payments` and `/api/v1/accounts` — 10r/s per IP, burst=20, returns 429
 
 ### Database
 
