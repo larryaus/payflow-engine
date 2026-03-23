@@ -1,68 +1,79 @@
-import { useState } from 'react';
-import { Card, Input, Button, Descriptions, message, Spin } from 'antd';
+import { useState, useEffect } from 'react';
+import { Card, Input, Table, Tag, message } from 'antd';
 import { SearchOutlined } from '@ant-design/icons';
-import { getAccountBalance } from '../api/account';
+import { listAccounts } from '../api/account';
 import type { AccountBalance } from '../types';
 import { formatAmount, formatTime } from '../utils/format';
 
 function AccountPage() {
-  const [accountId, setAccountId] = useState('');
-  const [balance, setBalance] = useState<AccountBalance | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [accounts, setAccounts] = useState<AccountBalance[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
 
-  const handleQuery = async () => {
-    if (!accountId.trim()) {
-      message.warning('请输入账户ID');
-      return;
-    }
-    setLoading(true);
-    try {
-      const data = await getAccountBalance(accountId.trim());
-      setBalance(data);
-    } catch {
-      message.error('账户查询失败');
-      setBalance(null);
-    } finally {
-      setLoading(false);
-    }
-  };
+  useEffect(() => {
+    listAccounts()
+      .then(setAccounts)
+      .catch(() => message.error('账户列表加载失败'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const filtered = search.trim()
+    ? accounts.filter(
+        (a) =>
+          a.account_id.toLowerCase().includes(search.toLowerCase()) ||
+          a.account_name.toLowerCase().includes(search.toLowerCase()),
+      )
+    : accounts;
 
   return (
-    <div style={{ maxWidth: 640, margin: '0 auto' }}>
-      <Card title="账户余额查询">
-        <div style={{ display: 'flex', gap: 12, marginBottom: 24 }}>
-          <Input
-            placeholder="输入账户ID，例: ACC_001"
-            value={accountId}
-            onChange={(e) => setAccountId(e.target.value)}
-            onPressEnter={handleQuery}
-            style={{ flex: 1 }}
-          />
-          <Button type="primary" icon={<SearchOutlined />} onClick={handleQuery} loading={loading}>
-            查询
-          </Button>
-        </div>
-
-        {loading && <Spin style={{ display: 'block', margin: '40px auto' }} />}
-
-        {balance && !loading && (
-          <Descriptions bordered column={1}>
-            <Descriptions.Item label="账户ID">{balance.account_id}</Descriptions.Item>
-            <Descriptions.Item label="可用余额">
-              <span style={{ color: '#52c41a', fontWeight: 'bold', fontSize: 18 }}>
-                {formatAmount(balance.available_balance)} {balance.currency}
+    <Card
+      title="账户列表"
+      extra={
+        <Input
+          placeholder="搜索账户ID或名称"
+          prefix={<SearchOutlined />}
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          allowClear
+          style={{ width: 240 }}
+        />
+      }
+    >
+      <Table
+        rowKey="account_id"
+        loading={loading}
+        dataSource={filtered}
+        pagination={false}
+        columns={[
+          { title: '账户ID', dataIndex: 'account_id' },
+          { title: '账户名', dataIndex: 'account_name' },
+          {
+            title: '可用余额',
+            dataIndex: 'available_balance',
+            render: (v: number, r: AccountBalance) => (
+              <span style={{ color: '#52c41a', fontWeight: 600 }}>
+                {formatAmount(v)} {r.currency}
               </span>
-            </Descriptions.Item>
-            <Descriptions.Item label="冻结金额">
-              <span style={{ color: '#faad14' }}>
-                {formatAmount(balance.frozen_balance)} {balance.currency}
-              </span>
-            </Descriptions.Item>
-            <Descriptions.Item label="更新时间">{formatTime(balance.updated_at)}</Descriptions.Item>
-          </Descriptions>
-        )}
-      </Card>
-    </div>
+            ),
+          },
+          {
+            title: '冻结金额',
+            dataIndex: 'frozen_balance',
+            render: (v: number, r: AccountBalance) =>
+              v > 0 ? (
+                <Tag color="orange">{formatAmount(v)} {r.currency}</Tag>
+              ) : (
+                <span style={{ color: '#999' }}>—</span>
+              ),
+          },
+          {
+            title: '更新时间',
+            dataIndex: 'updated_at',
+            render: (v: string) => formatTime(v),
+          },
+        ]}
+      />
+    </Card>
   );
 }
 

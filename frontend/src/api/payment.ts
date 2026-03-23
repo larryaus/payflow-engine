@@ -1,5 +1,5 @@
 import apiClient from './client';
-import type { PaymentOrder, CreatePaymentRequest, RefundRequest } from '../types';
+import type { PaymentOrder, CreatePaymentRequest, RefundRequest, RefundOrder } from '../types';
 
 /**
  * 生成幂等键
@@ -41,9 +41,17 @@ export async function listPayments(params?: {
 /**
  * 发起退款
  */
-export async function refundPayment(paymentId: string, data: RefundRequest): Promise<unknown> {
+export async function refundPayment(paymentId: string, data: RefundRequest): Promise<RefundOrder> {
   const response = await apiClient.post(`/payments/${paymentId}/refund`, data, {
     headers: { 'Idempotency-Key': generateIdempotencyKey() },
   });
+  return response.data;
+}
+
+/**
+ * 查询退款列表
+ */
+export async function listRefunds(paymentId: string): Promise<RefundOrder[]> {
+  const response = await apiClient.get(`/payments/${paymentId}/refunds`);
   return response.data;
 }

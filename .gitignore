@@ -55,3 +55,5 @@ docker-compose.override.yml
 *.pem
 *.key
 credentials.json
+
+.claude/

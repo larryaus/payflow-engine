@@ -1,6 +1,8 @@
 package com.payflow.payment.controller;
 
 import com.payflow.payment.domain.PaymentOrder;
+import com.payflow.payment.domain.RefundOrder;
+import com.payflow.payment.repository.RefundOrderRepository;
 import com.payflow.payment.service.PaymentService;
 import com.payflow.payment.service.RefundService;
 import org.springframework.data.domain.Page;
@@ -19,10 +21,13 @@ public class PaymentController {
 
     private final PaymentService paymentService;
     private final RefundService refundService;
+    private final RefundOrderRepository refundOrderRepository;
 
-    public PaymentController(PaymentService paymentService, RefundService refundService) {
+    public PaymentController(PaymentService paymentService, RefundService refundService,
+                             RefundOrderRepository refundOrderRepository) {
         this.paymentService = paymentService;
         this.refundService = refundService;
+        this.refundOrderRepository = refundOrderRepository;
     }
 
     /**
@@ -85,6 +90,27 @@ public class PaymentController {
                 "currency", order.getCurrency(),
                 "created_at", order.getCreatedAt().toString()
         ));
+    }
+
+    /**
+     * 查询退款列表
+     */
+    @GetMapping("/{paymentId}/refunds")
+    public ResponseEntity<List<Map<String, Object>>> listRefunds(@PathVariable String paymentId) {
+        List<Map<String, Object>> refunds = refundOrderRepository.findByPaymentId(paymentId).stream()
+                .map(r -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("refund_id", r.getRefundId());
+                    m.put("payment_id", r.getPaymentId());
+                    m.put("amount", r.getAmount());
+                    m.put("reason", r.getReason());
+                    m.put("status", r.getStatus().name());
+                    m.put("created_at", r.getCreatedAt().toString());
+                    m.put("completed_at", r.getCompletedAt() != null ? r.getCompletedAt().toString() : null);
+                    return m;
+                })
+                .toList();
+        return ResponseEntity.ok(refunds);
     }
 
     /**

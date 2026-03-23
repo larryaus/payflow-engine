@@ -5,6 +5,7 @@ import com.payflow.account.service.AccountService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -15,6 +16,23 @@ public class AccountController {
 
     public AccountController(AccountService accountService) {
         this.accountService = accountService;
+    }
+
+    @GetMapping
+    public ResponseEntity<List<Map<String, Object>>> listAccounts() {
+        List<Map<String, Object>> accounts = accountService.listAccounts().stream()
+                .map(a -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("account_id", a.getAccountId());
+                    m.put("account_name", a.getAccountName());
+                    m.put("available_balance", a.getAvailableBalance());
+                    m.put("frozen_balance", a.getFrozenBalance());
+                    m.put("currency", a.getCurrency());
+                    m.put("updated_at", a.getUpdatedAt().toString());
+                    return m;
+                })
+                .toList();
+        return ResponseEntity.ok(accounts);
     }
 
     @GetMapping("/{accountId}/balance")
