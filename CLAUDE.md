@@ -8,29 +8,35 @@ PayFlow Engine is a **polyglot microservices payment platform** simulating a fin
 
 ## Architecture
 
-Six services communicate via REST (sync) and Kafka (async):
+Six services communicate via REST (sync), with Temporal orchestrating the async payment workflow:
 
 | Service | Language/Framework | Port | Role |
 |---|---|---|---|
-| `payment-service` | Java 21 + Spring Boot 3 | 8081 | Orchestrator — accepts payments, coordinates flow |
+| `payment-service` | Java 21 + Spring Boot 3 | 8081 | Orchestrator — accepts payments, starts Temporal workflow |
 | `account-service` | Java 21 + Spring Boot 3 | 8082 | Balance management — freeze/transfer/unfreeze |
 | `ledger-service` | Java 21 + Spring Boot 3 | 8083 | Double-entry accounting records |
 | `risk-service` | Python 3.12 + FastAPI | 8084 | Policy enforcement — blacklist, amount limits |
 | `notification-service` | Go 1.22 | 8085 | Event-driven webhook/notification delivery |
 | `frontend` | React 18 + TypeScript + Vite | 3000 | SPA — payments UI |
 
-**Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6), Nginx
+**Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6), Nginx, Temporal 1.24
 
 **Rate limiting:** Nginx (`frontend/nginx.conf`) — `limit_req_zone` 10r/s per IP, burst=20, applies to all `/api/*` routes, returns 429 on exceed.
 
-### Payment Flow (Sync → Async)
+### Payment Flow (Sync → Temporal Workflow)
 ```
 Client → Payment Service → Redis (idempotency check) → Risk Service (sync)
-       → Account Service (freeze amount, sync) → Kafka publish
-       → Return 202 Accepted
+       → Start Temporal Workflow (async) → Return 202 Accepted
 
-Async: Kafka → Ledger Service (double-entry) + Account Service (transfer)
-             → Notification Service (webhook callbacks)
+Temporal PaymentWorkflow (task queue: payment-workflow-queue):
+  1. markProcessing     — update payment status
+  2. freezeAmount       — hold funds on source account
+  3. createLedgerEntry  — double-entry bookkeeping
+  4. transfer           — execute fund movement
+  5. markCompleted      — update payment status
+  6. sendNotification   — publish to Kafka → Notification Service (webhook)
+
+On failure: unfreezeAmount (Saga compensation) → markFailed → sendFailedNotification
 ```
 
 ---
@@ -42,13 +48,19 @@ payflow-engine/
 ├── payment-service/          # Java Spring Boot — payment orchestration
 │   └── src/main/java/com/payflow/payment/
 │       ├── controller/       # REST endpoints
-│       ├── service/          # Business logic
+│       ├── service/          # Business logic (starts Temporal workflow)
+│       ├── workflow/         # Temporal workflow + activities
+│       │   ├── PaymentWorkflow.java         # Workflow interface
+│       │   ├── PaymentWorkflowImpl.java     # Saga orchestration logic
+│       │   ├── PaymentActivities.java       # Activity interface (9 steps)
+│       │   ├── PaymentActivitiesImpl.java   # Activity implementations
+│       │   └── PaymentWorkflowInput.java    # Workflow input DTO
 │       ├── domain/           # JPA entities, state machine
 │       ├── repository/       # Data access
 │       ├── client/           # Feign clients (inter-service calls)
-│       ├── config/           # Spring beans, configs
+│       ├── config/           # Spring beans, TemporalConfig, IdempotencyFilter
 │       ├── exception/        # Custom exceptions, global handlers
-│       └── mq/               # Kafka producers/consumers
+│       └── mq/               # Kafka producer (notification broadcast only)
 ├── account-service/          # Java Spring Boot — balance management
 │   └── src/main/java/com/payflow/account/
 │       └── (same layer structure)
@@ -93,8 +105,8 @@ payflow-engine/
 # Start everything (all services + infra)
 docker-compose up -d
 
-# Start infrastructure only (postgres, redis, kafka)
-docker-compose up -d postgres redis kafka
+# Start infrastructure only (postgres, redis, kafka, temporal)
+docker-compose up -d postgres redis kafka temporal temporal-ui
 ```
 
 ### Running Individual Services
@@ -159,7 +171,10 @@ go build ./...
 - **Distributed locks:** Use Redisson (not raw Redis) for account-level operations
 - **State transitions:** `PaymentStatus` has `canTransitTo()` — always check before updating status
 - **Inter-service calls:** Use Feign clients in the `client/` package, not raw HTTP
-- **Kafka:** Publish via `PaymentEventProducer` — topics: `payment.created`, `payment.completed`, `payment.failed`, `ledger.entry`, `notification.send`, `risk.alert`
+- **Kafka:** Publish via `PaymentEventProducer` — topics: `notification.send`, `risk.alert` (payment flow steps are now Temporal activities, not Kafka events)
+- **Temporal workflows:** Use `WorkflowClient` from `TemporalConfig` to start workflows — task queue `payment-workflow-queue`, workflow ID format `payment-{paymentId}`
+- **Temporal activities:** Implement in `PaymentActivitiesImpl` — call Feign clients directly; retries (max 3) and timeouts (30s) are configured in `PaymentWorkflowImpl`
+- **Saga compensation:** On activity failure, `PaymentWorkflowImpl` calls `unfreezeAmount` before marking payment FAILED — never skip this
 
 ### TypeScript / React (Frontend)
 
@@ -211,8 +226,8 @@ Every financial movement creates a pair of ledger entries (debit account + credi
 ### 4. Payment State Machine
 `PaymentStatus` transitions are strictly enforced: `CREATED → PENDING → COMPLETED/FAILED`, `COMPLETED → REFUNDING → REFUNDED`. Always use `canTransitTo()` before changing status.
 
-### 5. Event-Driven Async Processing
-Payment acceptance (202) is decoupled from fulfillment. The payment-service publishes to Kafka and returns immediately — downstream services (ledger, account transfer, notifications) process asynchronously.
+### 5. Temporal Workflow Orchestration (Saga Pattern)
+Payment acceptance (202) is decoupled from fulfillment. After risk check, payment-service starts a Temporal workflow and returns immediately. The workflow orchestrates all downstream steps as activities (freeze → ledger → transfer → complete). On any activity failure, the workflow runs compensation (`unfreezeAmount`) before marking the payment FAILED. Workflow ID `payment-{paymentId}` ensures at-most-once execution. Monitor workflow executions at http://localhost:8088 (Temporal UI).
 
 ---
 

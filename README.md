@@ -30,22 +30,27 @@
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Message Queue (Kafka)                               │
-│  Topics: payment.created | payment.completed | payment.failed               │
-│          ledger.entry    | notification.send | risk.alert                   │
+│                    Temporal Server (port 7233)                              │
+│  Workflow: PaymentWorkflow  |  Task Queue: payment-workflow-queue           │
+│  Activities: freeze → ledger → transfer → complete/compensate              │
 └──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
+                               │ workflow activities (sync Feign)
          ┌─────────────────────┼─────────────────────┐
          ▼                     ▼                      ▼
-┌──────────────────┐  ┌──────────────┐  ┌──────────────────────┐
-│  PostgreSQL      │  │  Redis       │  │  Ledger Service      │
-│  (主数据库)       │  │  (缓存/锁)   │  │  (记账/分录服务)      │
-│                  │  │              │  │                      │
-│ - 支付订单表     │  │ - 幂等性控制  │  │ - 复式记账           │
-│ - 账户表         │  │ - 分布式锁   │  │ - 事务一致性         │
-│ - 分录表         │  │              │  │                      │
-│ - 退款表         │  │              │  │                      │
-└──────────────────┘  └──────────────┘  └──────────────────────┘
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐
+│  Account Service │  │  Ledger Service  │  │  Kafka (Notification)│
+│  freeze/transfer │  │  double-entry    │  │  notification.send   │
+└──────────────────┘  └──────────────────┘  └──────────────────────┘
+
+┌──────────────────┐  ┌──────────────┐
+│  PostgreSQL      │  │  Redis       │
+│  (主数据库)       │  │  (缓存/锁)   │
+│                  │  │              │
+│ - 支付订单表     │  │ - 幂等性控制  │
+│ - 账户表         │  │ - 分布式锁   │
+│ - 分录表         │  │              │
+│ - 退款表         │  │              │
+└──────────────────┘  └──────────────┘
 ```
 
 ---
@@ -60,6 +65,8 @@
 | `ledger-service` | 复式记账、分录管理 | Java 21 + Spring Boot 3 | 8083 |
 | `risk-service` | 风控规则引擎、黑名单、限额 | Python 3.12 + FastAPI | 8084 |
 | `notification-service` | Webhook 回调通知 | Go 1.22 | 8085 |
+| `temporal` | 工作流编排引擎（支付流程 Saga） | Temporal 1.24 | 7233 |
+| `temporal-ui` | Temporal 可视化控制台 | Temporal UI 2.26 | 8088 |
 
 ---
 
@@ -149,40 +156,43 @@ Response 200:
 
 ## 4. Payment Flow (支付流程)
 
+支付流程现在由 **Temporal 工作流**编排（取代原来的 Kafka 编舞模式）：
+
 ```
-Client             Nginx(frontend)    PaymentSvc      RiskSvc       AccountSvc      LedgerSvc       Kafka         NotifySvc
-  │                     │                │               │              │               │              │              │
-  │  POST /payments     │                │               │              │               │              │              │
-  │────────────────────>│                │               │              │               │              │              │
-  │                     │  限流检查       │               │              │               │              │              │
-  │                     │  (10r/s)       │               │              │               │              │              │
-  │                     │  proxy_pass   │               │              │               │              │              │
-  │                     │───────────────>│               │              │               │              │              │
-  │                     │                │  幂等性检查    │              │               │              │              │
-  │                     │                │  (Redis SETNX)│              │               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  1.风控检查    │              │               │              │              │
-  │                     │                │──────────────>│              │               │              │              │
-  │                     │                │  risk: PASS   │              │               │              │              │
-  │                     │                │<──────────────│              │               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  2.冻结付款方金额             │               │              │              │
-  │                     │                │─────────────────────────────>│               │              │              │
-  │                     │                │  freeze: OK                  │               │              │              │
-  │                     │                │<─────────────────────────────│               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  3.发布事件 payment.created   │               │              │              │
-  │                     │                │────────────────────────────────────────────────────────────>│              │
-  │  202 Accepted       │                │               │              │               │              │              │
-  │<────────────────────│                │               │              │               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │ (async)        │               │              │               │              │              │
-  │                     │                │               │              │  4.复式记账    │<─────────────│              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │               │  5.解冻+转账  │               │<─────────────│              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │               │              │               │              │─────────────>│
-  │                     │                │               │              │               │              │  6.Webhook   │──> callback
+Client          Nginx           PaymentSvc      RiskSvc     Temporal       AccountSvc    LedgerSvc     Kafka        NotifySvc
+  │               │                │               │             │              │             │             │             │
+  │ POST /payments│                │               │             │              │             │             │             │
+  │──────────────>│                │               │             │              │             │             │             │
+  │               │ 限流(10r/s)    │               │             │              │             │             │             │
+  │               │───────────────>│               │             │              │             │             │             │
+  │               │                │ 幂等检查(Redis)│             │              │             │             │             │
+  │               │                │ 1.风控检查    │             │              │             │             │             │
+  │               │                │──────────────>│             │              │             │             │             │
+  │               │                │  PASS         │             │              │             │             │             │
+  │               │                │<──────────────│             │              │             │             │             │
+  │               │                │ 2.启动 Workflow│             │              │             │             │             │
+  │               │                │──────────────────────────>  │              │             │             │             │
+  │  202 Accepted │                │               │             │              │             │             │             │
+  │<──────────────│                │               │             │              │             │             │             │
+  │               │                │               │  (async)    │              │             │             │             │
+  │               │                │               │             │ 3.markProcessing            │             │             │
+  │               │                │               │             │──────────────────────────────────────────────────────> │
+  │               │                │               │             │ 4.freezeAmount│             │             │             │
+  │               │                │               │             │─────────────>│             │             │             │
+  │               │                │               │             │ 5.createLedger│             │             │             │
+  │               │                │               │             │──────────────────────────>  │             │             │
+  │               │                │               │             │ 6.transfer    │             │             │             │
+  │               │                │               │             │─────────────>│             │             │             │
+  │               │                │               │             │ 7.markCompleted             │             │             │
+  │               │                │               │             │ 8.sendNotification          │             │             │
+  │               │                │               │             │─────────────────────────────────────────>│             │
+  │               │                │               │             │              │             │             │────────────>│
+  │               │                │               │             │              │             │             │  Webhook    │──> callback
+  │               │                │               │             │              │             │             │             │
+  │               │ (on failure)   │               │             │              │             │             │             │
+  │               │                │               │             │ unfreezeAmount(compensation)│             │             │
+  │               │                │               │             │─────────────>│             │             │             │
+  │               │                │               │             │ markFailed   │             │             │             │
 ```
 
 ### 4.1 支付状态机
@@ -293,18 +303,23 @@ limit_req_status 429;
 └── 合并扣款: 批量处理同一账户的请求
 ```
 
-### 5.5 异步化 + 事件驱动
+### 5.5 异步化 + Temporal 工作流编排
 
 ```
-同步链路(用户等待): 风控检查 → 冻结金额 → 返回 202
-异步链路(后台处理): 分录记账 → 实际转账 → 解冻 → 通知
+同步链路(用户等待): 风控检查 → 启动 Temporal Workflow → 返回 202
+异步链路(Temporal 编排):
+  markProcessing → freezeAmount → createLedgerEntry
+  → transfer → markCompleted → sendNotification
+  失败补偿: unfreezeAmount → markFailed → sendFailedNotification
 
-Kafka Topic 设计:
-├── payment.created     (Partition by account_id, 保证同账户顺序)
-├── payment.completed
-├── payment.failed
-├── ledger.entry
-├── notification.send
+Temporal Workflow 配置:
+├── Task Queue: payment-workflow-queue
+├── Workflow ID: payment-{paymentId}  (确定性幂等)
+├── Activity 重试: maxAttempts=3, scheduleToCloseTimeout=30s
+└── Saga 补偿: 任意步骤失败 → 自动解冻资金
+
+Kafka 仅用于最终通知广播:
+├── notification.send   (触发 Webhook 回调)
 └── risk.alert
 ```
 
@@ -424,8 +439,14 @@ payflow-engine/
 │       ├── controller/
 │       │   └── PaymentController.java          # REST API 入口
 │       ├── service/
-│       │   ├── PaymentService.java             # 支付编排(主流程)
+│       │   ├── PaymentService.java             # 启动 Temporal Workflow
 │       │   └── RefundService.java              # 退款逻辑
+│       ├── workflow/
+│       │   ├── PaymentWorkflow.java            # Workflow 接口
+│       │   ├── PaymentWorkflowImpl.java        # Workflow 实现 (Saga 编排)
+│       │   ├── PaymentActivities.java          # Activity 接口 (9个步骤)
+│       │   ├── PaymentActivitiesImpl.java      # Activity 实现 (Feign + Kafka)
+│       │   └── PaymentWorkflowInput.java       # Workflow 输入 DTO
 │       ├── domain/
 │       │   ├── PaymentOrder.java               # 支付订单实体
 │       │   ├── PaymentStatus.java              # 状态枚举(含状态机)
@@ -439,10 +460,10 @@ payflow-engine/
 │       │   ├── RiskClient.java                 # Feign → risk-service
 │       │   └── LedgerClient.java               # Feign → ledger-service
 │       ├── mq/
-│       │   ├── PaymentEventProducer.java       # Kafka 生产者
-│       │   └── PaymentEventConsumer.java       # Kafka 消费者
+│       │   └── PaymentEventProducer.java       # Kafka 生产者(通知广播)
 │       ├── config/
-│       │   └── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
+│       │   ├── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
+│       │   └── TemporalConfig.java             # Temporal Worker + WorkflowClient
 │       └── exception/
 │           ├── PaymentException.java
 │           └── GlobalExceptionHandler.java
@@ -529,6 +550,22 @@ payflow-engine/
 - 用最小货币单位(分)的整数表示，完全避免精度丢失
 - 展示层再除以 100 转为元
 
+### 8.5 为什么用 Temporal 替代 Kafka 编舞?
+
+原来的架构通过 Kafka 事件编舞（choreography）协调各服务，存在以下问题：
+- 流程分散在多个消费者中，难以追踪全局状态
+- 补偿逻辑（失败回滚）需要手动实现并维护
+
+Temporal **工作流编排（orchestration）** 的优势：
+```
+可见性:   Temporal UI 实时展示每一步活动状态和执行历史
+可靠性:   内置重试、超时、幂等 (Workflow ID = payment-{id})
+补偿:     Saga 模式 — 失败时自动触发 unfreezeAmount 补偿活动
+持久性:   Workflow 状态持久化，服务重启后自动续跑
+```
+
+Kafka 保留用于最终通知广播（notification.send），这是 pub/sub 的自然场景。
+
 ### 8.4 高可用保障
 
 ```
@@ -566,8 +603,8 @@ payflow-engine/
 git clone https://github.com/larryaus/payflow-engine.git
 cd payflow-engine
 
-# 2. 启动基础设施 (PostgreSQL + Redis + Kafka)
-docker-compose up -d postgres redis kafka
+# 2. 启动基础设施 (PostgreSQL + Redis + Kafka + Temporal)
+docker-compose up -d postgres redis kafka temporal temporal-ui
 
 # 3. 等待基础设施就绪 (约 10-15 秒)
 echo "Waiting for infrastructure..."
@@ -664,10 +701,12 @@ docker-compose down -v
 │ Ledger Service                   │ 8083   │ http://localhost:8083     │
 │ Risk Service                     │ 8084   │ http://localhost:8084     │
 │ Notification Service             │ 8085   │ http://localhost:8085     │
+│ Temporal UI                      │ 8088   │ http://localhost:8088     │
 ├──────────────────────────────────┼────────┼──────────────────────────┤
 │ PostgreSQL                       │ 5432   │ localhost:5432            │
 │ Redis                            │ 6379   │ localhost:6379            │
 │ Kafka                            │ 9092   │ localhost:9092            │
+│ Temporal Server                  │ 7233   │ localhost:7233            │
 └──────────────────────────────────┴────────┴──────────────────────────┘
 ```
 
