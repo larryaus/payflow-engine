@@ -1,0 +1,3 @@
+temporal:
+  service-address: ${TEMPORAL_SERVICE_ADDRESS:localhost:7233}
+  task-queue: payment-workflow-queue
