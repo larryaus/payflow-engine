@@ -4,7 +4,7 @@ import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
-@FeignClient(name = "risk-service", url = "${services.risk.url}")
+@FeignClient(name = "risk-service", url = "${services.risk.url}", fallbackFactory = RiskClientFallbackFactory.class)
 public interface RiskClient {
 
     @PostMapping("/api/v1/risk/check")

@@ -4,7 +4,7 @@ import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 
-@FeignClient(name = "account-service", url = "${services.account.url}")
+@FeignClient(name = "account-service", url = "${services.account.url}", fallbackFactory = AccountClientFallbackFactory.class)
 public interface AccountClient {
 
     @PostMapping("/api/v1/accounts/freeze")
