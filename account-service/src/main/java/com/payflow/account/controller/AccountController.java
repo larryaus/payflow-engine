@@ -71,4 +71,13 @@ public class AccountController {
         accountService.transfer(fromAccount, toAccount, amount);
         return ResponseEntity.ok().build();
     }
+
+    @PostMapping("/reverse-transfer")
+    public ResponseEntity<Void> reverseTransfer(
+            @RequestParam("from_account") String fromAccount,
+            @RequestParam("to_account") String toAccount,
+            @RequestParam("amount") Long amount) {
+        accountService.reverseTransfer(fromAccount, toAccount, amount);
+        return ResponseEntity.ok().build();
+    }
 }

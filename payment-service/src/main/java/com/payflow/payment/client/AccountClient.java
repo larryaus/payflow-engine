@@ -22,4 +22,10 @@ public interface AccountClient {
             @RequestParam("from_account") String fromAccount,
             @RequestParam("to_account") String toAccount,
             @RequestParam("amount") Long amount);
+
+    @PostMapping("/api/v1/accounts/reverse-transfer")
+    void reverseTransfer(
+            @RequestParam("from_account") String fromAccount,
+            @RequestParam("to_account") String toAccount,
+            @RequestParam("amount") Long amount);
 }

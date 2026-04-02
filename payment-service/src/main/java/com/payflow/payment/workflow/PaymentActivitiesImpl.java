@@ -49,9 +49,21 @@ public class PaymentActivitiesImpl implements PaymentActivities {
     }
 
     @Override
+    public void reverseLedgerEntry(String paymentId) {
+        log.info("Reversing ledger entry for payment {}", paymentId);
+        ledgerClient.reverseEntry(paymentId);
+    }
+
+    @Override
     public void transfer(String fromAccount, String toAccount, Long amount) {
         log.info("Executing transfer from {} to {} amount {}", fromAccount, toAccount, amount);
         accountClient.transfer(fromAccount, toAccount, amount);
+    }
+
+    @Override
+    public void reverseTransfer(String fromAccount, String toAccount, Long amount) {
+        log.info("Reversing transfer from {} to {} amount {}", fromAccount, toAccount, amount);
+        accountClient.reverseTransfer(fromAccount, toAccount, amount);
     }
 
     @Override

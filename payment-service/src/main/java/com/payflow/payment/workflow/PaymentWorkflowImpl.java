@@ -25,13 +25,19 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
     public void processPayment(PaymentWorkflowInput input) {
         String paymentId = input.getPaymentId();
 
-        // 1. 标记处理中
-        activities.markProcessing(paymentId);
-
-        // 2. 冻结付款方金额
-        activities.freezeAmount(input.getFromAccount(), input.getAmount());
+        // 记录每个步骤是否已成功执行，用于决定需要执行哪些补偿
+        boolean frozen = false;
+        boolean ledgerCreated = false;
+        boolean transferred = false;
 
         try {
+            // 1. 标记处理中
+            activities.markProcessing(paymentId);
+
+            // 2. 冻结付款方金额
+            activities.freezeAmount(input.getFromAccount(), input.getAmount());
+            frozen = true;
+
             // 3. 创建复式记账分录
             activities.createLedgerEntry(
                     paymentId,
@@ -39,6 +45,7 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
                     input.getToAccount(),
                     input.getAmount()
             );
+            ledgerCreated = true;
 
             // 4. 解冻并执行转账
             activities.transfer(
@@ -46,22 +53,35 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
                     input.getToAccount(),
                     input.getAmount()
             );
+            transferred = true;
 
             // 5. 标记完成
             activities.markCompleted(paymentId);
 
-            // 6. 发送完成通知（Kafka → notification-service）
+            // 6. 发送完成通知
             activities.sendCompletedNotification(paymentId);
 
             log.info("Payment workflow completed for {}", paymentId);
 
         } catch (Exception e) {
-            log.error("Payment workflow failed for {}: {}", paymentId, e.getMessage());
+            log.error("Payment workflow failed for {}: {}, compensating (transferred={}, ledgerCreated={}, frozen={})",
+                    paymentId, e.getMessage(), transferred, ledgerCreated, frozen);
 
-            // 补偿：解冻已冻结金额
-            activities.unfreezeAmount(input.getFromAccount(), input.getAmount());
+            // 补偿按成功步骤逆序执行
+            if (transferred) {
+                activities.reverseTransfer(
+                        input.getFromAccount(),
+                        input.getToAccount(),
+                        input.getAmount()
+                );
+            }
+            if (ledgerCreated) {
+                activities.reverseLedgerEntry(paymentId);
+            }
+            if (frozen) {
+                activities.unfreezeAmount(input.getFromAccount(), input.getAmount());
+            }
 
-            // 标记失败并通知
             activities.markFailed(paymentId, e.getMessage());
             activities.sendFailedNotification(paymentId, e.getMessage());
         }

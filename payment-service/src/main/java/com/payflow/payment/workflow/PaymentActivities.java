@@ -16,7 +16,13 @@ public interface PaymentActivities {
     void createLedgerEntry(String paymentId, String fromAccount, String toAccount, Long amount);
 
     @ActivityMethod
+    void reverseLedgerEntry(String paymentId);
+
+    @ActivityMethod
     void transfer(String fromAccount, String toAccount, Long amount);
+
+    @ActivityMethod
+    void reverseTransfer(String fromAccount, String toAccount, Long amount);
 
     @ActivityMethod
     void markProcessing(String paymentId);
