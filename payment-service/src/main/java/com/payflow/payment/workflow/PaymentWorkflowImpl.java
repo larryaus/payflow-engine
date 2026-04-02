@@ -2,6 +2,7 @@ package com.payflow.payment.workflow;
 
 import io.temporal.activity.ActivityOptions;
 import io.temporal.common.RetryOptions;
+import io.temporal.workflow.Saga;
 import io.temporal.workflow.Workflow;
 import org.slf4j.Logger;
 
@@ -25,10 +26,7 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
     public void processPayment(PaymentWorkflowInput input) {
         String paymentId = input.getPaymentId();
 
-        // 记录每个步骤是否已成功执行，用于决定需要执行哪些补偿
-        boolean frozen = false;
-        boolean ledgerCreated = false;
-        boolean transferred = false;
+        Saga saga = new Saga(new Saga.Options.Builder().setParallelCompensation(false).build());
 
         try {
             // 1. 标记处理中
@@ -36,7 +34,7 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
 
             // 2. 冻结付款方金额
             activities.freezeAmount(input.getFromAccount(), input.getAmount());
-            frozen = true;
+            saga.addCompensation(() -> activities.unfreezeAmount(input.getFromAccount(), input.getAmount()));
 
             // 3. 创建复式记账分录
             activities.createLedgerEntry(
@@ -45,7 +43,7 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
                     input.getToAccount(),
                     input.getAmount()
             );
-            ledgerCreated = true;
+            saga.addCompensation(() -> activities.reverseLedgerEntry(paymentId));
 
             // 4. 解冻并执行转账
             activities.transfer(
@@ -53,7 +51,11 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
                     input.getToAccount(),
                     input.getAmount()
             );
-            transferred = true;
+            saga.addCompensation(() -> activities.reverseTransfer(
+                    input.getFromAccount(),
+                    input.getToAccount(),
+                    input.getAmount()
+            ));
 
             // 5. 标记完成
             activities.markCompleted(paymentId);
@@ -64,24 +66,8 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
             log.info("Payment workflow completed for {}", paymentId);
 
         } catch (Exception e) {
-            log.error("Payment workflow failed for {}: {}, compensating (transferred={}, ledgerCreated={}, frozen={})",
-                    paymentId, e.getMessage(), transferred, ledgerCreated, frozen);
-
-            // 补偿按成功步骤逆序执行
-            if (transferred) {
-                activities.reverseTransfer(
-                        input.getFromAccount(),
-                        input.getToAccount(),
-                        input.getAmount()
-                );
-            }
-            if (ledgerCreated) {
-                activities.reverseLedgerEntry(paymentId);
-            }
-            if (frozen) {
-                activities.unfreezeAmount(input.getFromAccount(), input.getAmount());
-            }
-
+            log.error("Payment workflow failed for {}: {}, starting compensation", paymentId, e.getMessage());
+            saga.compensate();
             activities.markFailed(paymentId, e.getMessage());
             activities.sendFailedNotification(paymentId, e.getMessage());
         }
