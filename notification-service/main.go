@@ -18,8 +18,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 启动 Kafka 消费者(异步)
-	go consumer.StartKafkaConsumer(ctx)
+	// 启动 Kafka 消费者(异步)；consumerDone 在所有 topic goroutine 退出后关闭。
+	consumerDone := make(chan struct{})
+	go func() {
+		consumer.StartKafkaConsumer(ctx)
+		close(consumerDone)
+	}()
 
 	// HTTP 健康检查端点
 	mux := http.NewServeMux()
@@ -50,6 +54,9 @@ func main() {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("HTTP server shutdown error: %v", err)
 		}
+
+		// 等待所有 consumer goroutine 退出后再让进程结束
+		<-consumerDone
 	}()
 
 	log.Println("Notification service starting on :8085")

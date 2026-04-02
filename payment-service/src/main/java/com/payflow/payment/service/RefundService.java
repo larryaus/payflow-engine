@@ -51,13 +51,11 @@ public class RefundService {
 
     @Transactional
     public RefundOrder createRefund(String paymentId, String idempotencyKey, RefundRequest request) {
-        // 幂等检查
         if (idempotencyFilter.isDuplicate(idempotencyKey)) {
             return refundOrderRepository.findByIdempotencyKey(idempotencyKey)
                     .orElseThrow(() -> new PaymentException("IDEMPOTENCY_CONFLICT", "Duplicate refund request"));
         }
 
-        // 校验原支付单
         PaymentOrder payment = paymentOrderRepository.findByPaymentId(paymentId)
                 .orElseThrow(() -> new PaymentException("NOT_FOUND", "Payment not found"));
 
@@ -69,42 +67,86 @@ public class RefundService {
             throw new PaymentException("INVALID_AMOUNT", "Refund amount exceeds payment amount");
         }
 
-        // 创建退款单
+        RefundOrder refund = buildRefundOrder(paymentId, idempotencyKey, request);
+        refundOrderRepository.save(refund);
+
+        executeRefundSaga(refund, payment, request);
+
+        refundOrderRepository.save(refund);
+        return refund;
+    }
+
+    // --- Saga orchestration ---
+
+    private void executeRefundSaga(RefundOrder refund, PaymentOrder payment, RefundRequest request) {
+        if (!stepFreeze(refund, payment, request.amount())) {
+            return;
+        }
+        if (!stepTransferAndRecord(refund, payment, request.amount())) {
+            compensateUnfreeze(refund, payment, request.amount());
+            return;
+        }
+        markCompleted(refund, payment, request.amount());
+    }
+
+    // --- Saga steps ---
+
+    private boolean stepFreeze(RefundOrder refund, PaymentOrder payment, Long amount) {
+        try {
+            accountClient.freezeAmount(payment.getToAccount(), amount);
+            return true;
+        } catch (Exception e) {
+            log.error("Refund {} freeze failed: {}", refund.getRefundId(), e.getMessage());
+            refund.setStatus(RefundStatus.FAILED);
+            return false;
+        }
+    }
+
+    private boolean stepTransferAndRecord(RefundOrder refund, PaymentOrder payment, Long amount) {
+        try {
+            accountClient.transfer(payment.getToAccount(), payment.getFromAccount(), amount);
+            ledgerClient.createEntry(refund.getRefundId(),
+                    payment.getToAccount(), payment.getFromAccount(), amount);
+            return true;
+        } catch (Exception e) {
+            log.error("Refund {} transfer/ledger failed, compensating: {}", refund.getRefundId(), e.getMessage());
+            return false;
+        }
+    }
+
+    // --- Compensation ---
+
+    private void compensateUnfreeze(RefundOrder refund, PaymentOrder payment, Long amount) {
+        try {
+            accountClient.unfreezeAmount(payment.getToAccount(), amount);
+        } catch (Exception e) {
+            log.error("Refund {} compensation (unfreeze) failed — manual intervention required: {}",
+                    refund.getRefundId(), e.getMessage());
+        }
+        refund.setStatus(RefundStatus.FAILED);
+    }
+
+    // --- Post-saga state update ---
+
+    private void markCompleted(RefundOrder refund, PaymentOrder payment, Long amount) {
+        refund.setStatus(RefundStatus.COMPLETED);
+        refund.setCompletedAt(Instant.now());
+
+        if (amount.equals(payment.getAmount())) {
+            payment.transitTo(PaymentStatus.REFUNDED);
+            paymentOrderRepository.save(payment);
+        }
+    }
+
+    // --- Helpers ---
+
+    private RefundOrder buildRefundOrder(String paymentId, String idempotencyKey, RefundRequest request) {
         RefundOrder refund = new RefundOrder();
         refund.setRefundId(generateRefundId());
         refund.setPaymentId(paymentId);
         refund.setIdempotencyKey(idempotencyKey);
         refund.setAmount(request.amount());
         refund.setReason(request.reason());
-        refundOrderRepository.save(refund);
-
-        // 反向转账: 收款方 → 付款方 (freeze-then-transfer)
-        try {
-            accountClient.freezeAmount(payment.getToAccount(), request.amount());
-            try {
-                accountClient.transfer(payment.getToAccount(), payment.getFromAccount(), request.amount());
-                ledgerClient.createEntry(refund.getRefundId(),
-                        payment.getToAccount(), payment.getFromAccount(), request.amount());
-
-                refund.setStatus(RefundStatus.COMPLETED);
-                refund.setCompletedAt(Instant.now());
-
-                // 如果全额退款, 更新原支付单状态
-                if (request.amount().equals(payment.getAmount())) {
-                    payment.transitTo(PaymentStatus.REFUNDED);
-                    paymentOrderRepository.save(payment);
-                }
-            } catch (Exception e) {
-                log.error("Refund {} failed after freeze, rolling back: {}", refund.getRefundId(), e.getMessage());
-                accountClient.unfreezeAmount(payment.getToAccount(), request.amount());
-                refund.setStatus(RefundStatus.FAILED);
-            }
-        } catch (Exception e) {
-            log.error("Refund {} failed: {}", refund.getRefundId(), e.getMessage());
-            refund.setStatus(RefundStatus.FAILED);
-        }
-
-        refundOrderRepository.save(refund);
         return refund;
     }
 

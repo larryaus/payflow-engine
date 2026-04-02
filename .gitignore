@@ -56,4 +56,3 @@ docker-compose.override.yml
 *.key
 credentials.json
 
-.claude/

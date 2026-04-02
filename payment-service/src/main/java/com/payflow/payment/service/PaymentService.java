@@ -49,25 +49,13 @@ public class PaymentService {
         this.workflowClient = workflowClient;
     }
 
-    private static final int DUPLICATE_MAX_RETRIES = 5;
-    private static final long DUPLICATE_RETRY_INTERVAL_MS = 200;
-
     /**
-     * 创建支付订单 — 核心支付流程编排
+     * 创建支付订单并启动 Temporal Workflow 异步处理
      *
-     * 流程: 幂等占位(原子) → 创建订单 → 标记完成 → 风控 → 异步处理
-     *
-     * 幂等保证: Redis SETNX 原子占位，订单持久化后回写 paymentId。
-     * 重复请求通过 paymentId 直接查询已有订单，若原始请求仍在处理中则短暂轮询等待。
+     * 流程: 幂等占位(Filter) → 订单持久化 → 风控检查 → 启动 Temporal Workflow
      */
     @Transactional
     public PaymentOrder createPayment(String idempotencyKey, CreatePaymentRequest request) {
-        // 1. 原子性幂等占位
-        if (!idempotencyFilter.tryAcquire(idempotencyKey)) {
-            // 重复请求 — 等待原始请求完成并返回已有订单
-            return waitForExistingOrder(idempotencyKey);
-        }
-
         try {
             // 2. 创建订单
             PaymentOrder order = new PaymentOrder();
@@ -94,10 +82,9 @@ public class PaymentService {
                 throw new PaymentException("RISK_REJECTED", "风控拒绝此交易");
             }
             order.transitTo(PaymentStatus.PENDING);
-
-            // 5. 启动 Temporal Workflow 异步处理(冻结 → 记账 → 扣款 → 通知)
             paymentOrderRepository.save(order);
 
+            // 5. 启动 Temporal Workflow 异步处理(冻结 → 记账 → 转账 → 通知)
             PaymentWorkflowInput workflowInput = new PaymentWorkflowInput(
                     order.getPaymentId(),
                     order.getFromAccount(),
@@ -114,33 +101,9 @@ public class PaymentService {
 
             return order;
         } catch (Exception e) {
-            // 占位成功但处理失败时，回写失败标记以便重复请求能快速感知
-            // 保留 Redis key（防止 24h 内重复提交相同请求）
             log.error("Payment creation failed for idempotencyKey={}: {}", idempotencyKey, e.getMessage());
             throw e;
         }
-    }
-
-    /**
-     * 重复请求等待原始订单完成 — 短暂轮询 Redis 直到 paymentId 可用
-     */
-    private PaymentOrder waitForExistingOrder(String idempotencyKey) {
-        for (int i = 0; i < DUPLICATE_MAX_RETRIES; i++) {
-            var existingId = idempotencyFilter.getExistingPaymentId(idempotencyKey);
-            if (existingId.isPresent()) {
-                return paymentOrderRepository.findByPaymentId(existingId.get())
-                        .orElseThrow(() -> new PaymentException("IDEMPOTENCY_CONFLICT",
-                                "Duplicate request, but original order not found"));
-            }
-            try {
-                Thread.sleep(DUPLICATE_RETRY_INTERVAL_MS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new PaymentException("IDEMPOTENCY_CONFLICT", "Interrupted while waiting for original order");
-            }
-        }
-        throw new PaymentException("IDEMPOTENCY_CONFLICT",
-                "Duplicate request, original order still processing. Please retry later.");
     }
 
     public Page<PaymentOrder> listPayments(int page, int size) {
