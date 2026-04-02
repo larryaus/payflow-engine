@@ -35,6 +35,20 @@ public class LedgerService {
         return repository.save(entry);
     }
 
+    @Transactional
+    public LedgerEntry reverseEntry(String originalReferenceId, String debitAccount,
+                                     String creditAccount, Long amount) {
+        LedgerEntry reversal = new LedgerEntry();
+        reversal.setEntryId("LED_REV_" + UUID.randomUUID().toString().substring(0, 12));
+        reversal.setPaymentId("REVERSAL_" + originalReferenceId);
+        reversal.setDebitAccount(creditAccount);
+        reversal.setCreditAccount(debitAccount);
+        reversal.setAmount(amount);
+        reversal.setEntryType("REVERSAL");
+        reversal.setStatus("COMPLETED");
+        return repository.save(reversal);
+    }
+
     public List<LedgerEntry> getEntriesByPaymentId(String paymentId) {
         return repository.findByPaymentId(paymentId);
     }
