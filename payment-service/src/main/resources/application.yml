@@ -1,0 +1,23 @@
+spring:
+  cloud:
+    openfeign:
+      circuitbreaker:
+        enabled: true
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 80
+    instances:
+      account-service:
+        base-config: default
+      risk-service:
+        base-config: default
+      ledger-service:
+        base-config: default
