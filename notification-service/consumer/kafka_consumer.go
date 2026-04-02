@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -22,14 +23,20 @@ func kafkaBroker() string {
 
 // StartKafkaConsumer 启动 Kafka 消费者，监听 payment.completed 和 payment.failed 事件。
 // 使用 consumer group 确保每条消息只被一个实例处理；offset 自动提交。
+// 阻塞直到所有 topic goroutine 退出（即 ctx 取消后全部处理完毕）。
 func StartKafkaConsumer(ctx context.Context) {
 	topics := []string{"payment.completed", "payment.failed", "notification.send"}
 
+	var wg sync.WaitGroup
 	for _, topic := range topics {
-		go consumeTopic(ctx, topic)
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			consumeTopic(ctx, t)
+		}(topic)
 	}
 
-	<-ctx.Done()
+	wg.Wait()
 	log.Println("Kafka consumer shutting down")
 }
 
@@ -80,17 +87,7 @@ func handleMessage(topic string, value []byte) {
 	}
 
 	switch topic {
-	case "payment.completed", "payment.failed":
-		// 支付完成/失败 → 触发 webhook 回调
-		callbackURL, _ := payload["callback_url"].(string)
-		if callbackURL == "" {
-			log.Printf("[%s] no callback_url in payload, skipping webhook", topic)
-			return
-		}
-		handler.SendWebhookWithRetry(callbackURL, payload)
-
-	case "notification.send":
-		// 通用通知事件
+	case "payment.completed", "payment.failed", "notification.send":
 		callbackURL, _ := payload["callback_url"].(string)
 		if callbackURL == "" {
 			log.Printf("[%s] no callback_url in payload, skipping", topic)

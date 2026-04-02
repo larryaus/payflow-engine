@@ -3,10 +3,14 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"time"
 )
+
+// webhookClient is a shared HTTP client with a timeout to prevent hanging connections.
+var webhookClient = &http.Client{Timeout: 10 * time.Second}
 
 // WebhookHandler 处理 Webhook 回调通知
 func WebhookHandler(w http.ResponseWriter, r *http.Request) {
@@ -33,10 +37,15 @@ func SendWebhookWithRetry(url string, payload map[string]interface{}) {
 	backoff := 2 * time.Second
 
 	for i := 0; i <= maxRetries; i++ {
-		resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-		if err == nil && resp.StatusCode < 300 {
-			log.Printf("Webhook sent successfully to %s", url)
-			return
+		resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(body))
+		if err == nil {
+			// Drain and close the body to allow connection reuse.
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode < 300 {
+				log.Printf("Webhook sent successfully to %s", url)
+				return
+			}
 		}
 		if i < maxRetries {
 			log.Printf("Webhook to %s failed (attempt %d), retrying in %v", url, i+1, backoff)
