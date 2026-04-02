@@ -54,4 +54,20 @@ public class AccountService {
         accountRepository.save(from);
         accountRepository.save(to);
     }
+
+    /**
+     * 逆向转账补偿: 从收款方可用余额扣回，退还给付款方可用余额
+     * 仅用于 Saga 补偿，不经过冻结流程
+     */
+    @Transactional
+    public void reverseTransfer(String fromAccountId, String toAccountId, Long amount) {
+        Account from = getAccount(fromAccountId);
+        Account to = getAccount(toAccountId);
+
+        to.deductAvailable(amount);
+        from.credit(amount);
+
+        accountRepository.save(from);
+        accountRepository.save(to);
+    }
 }
