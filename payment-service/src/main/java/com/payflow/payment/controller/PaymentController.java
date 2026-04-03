@@ -1,19 +1,19 @@
 package com.payflow.payment.controller;
 
 import com.payflow.payment.domain.PaymentOrder;
-import com.payflow.payment.domain.RefundOrder;
-import com.payflow.payment.repository.RefundOrderRepository;
+import com.payflow.payment.dto.CreatePaymentResponse;
+import com.payflow.payment.dto.PaymentListResponse;
+import com.payflow.payment.dto.PaymentResponse;
+import com.payflow.payment.dto.RefundDetailResponse;
+import com.payflow.payment.dto.RefundResponse;
 import com.payflow.payment.service.PaymentService;
 import com.payflow.payment.service.RefundService;
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
-import java.util.Map;
 
 @RestController
 @RequestMapping("/api/v1/payments")
@@ -21,29 +21,26 @@ public class PaymentController {
 
     private final PaymentService paymentService;
     private final RefundService refundService;
-    private final RefundOrderRepository refundOrderRepository;
 
-    public PaymentController(PaymentService paymentService, RefundService refundService,
-                             RefundOrderRepository refundOrderRepository) {
+    public PaymentController(PaymentService paymentService, RefundService refundService) {
         this.paymentService = paymentService;
         this.refundService = refundService;
-        this.refundOrderRepository = refundOrderRepository;
     }
 
     /**
      * 创建支付订单
      */
     @PostMapping
-    public ResponseEntity<Map<String, Object>> createPayment(
+    public ResponseEntity<CreatePaymentResponse> createPayment(
             @RequestHeader("Idempotency-Key") String idempotencyKey,
             @RequestBody CreatePaymentRequest request) {
 
         PaymentOrder order = paymentService.createPayment(idempotencyKey, request);
 
-        return ResponseEntity.status(HttpStatus.CREATED).body(Map.of(
-                "payment_id", order.getPaymentId(),
-                "status", order.getStatus().name(),
-                "created_at", order.getCreatedAt().toString()
+        return ResponseEntity.status(HttpStatus.CREATED).body(new CreatePaymentResponse(
+                order.getPaymentId(),
+                order.getStatus().name(),
+                order.getCreatedAt().toString()
         ));
     }
 
@@ -51,64 +48,42 @@ public class PaymentController {
      * 查询支付列表（分页）
      */
     @GetMapping
-    public ResponseEntity<Map<String, Object>> listPayments(
+    public ResponseEntity<PaymentListResponse> listPayments(
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int size) {
 
         Page<PaymentOrder> result = paymentService.listPayments(page, size);
-        List<Map<String, Object>> items = result.getContent().stream()
-                .map(order -> Map.<String, Object>of(
-                        "payment_id", order.getPaymentId(),
-                        "status", order.getStatus().name(),
-                        "from_account", order.getFromAccount(),
-                        "to_account", order.getToAccount(),
-                        "amount", order.getAmount(),
-                        "currency", order.getCurrency(),
-                        "created_at", order.getCreatedAt().toString()
-                ))
+        List<PaymentResponse> items = result.getContent().stream()
+                .map(PaymentController::toPaymentResponse)
                 .toList();
 
-        return ResponseEntity.ok(Map.of(
-                "data", items,
-                "total", result.getTotalElements()
-        ));
+        return ResponseEntity.ok(new PaymentListResponse(items, result.getTotalElements()));
     }
 
     /**
      * 查询支付状态
      */
     @GetMapping("/{paymentId}")
-    public ResponseEntity<Map<String, Object>> getPayment(@PathVariable String paymentId) {
+    public ResponseEntity<PaymentResponse> getPayment(@PathVariable String paymentId) {
         PaymentOrder order = paymentService.getPayment(paymentId);
-
-        return ResponseEntity.ok(Map.of(
-                "payment_id", order.getPaymentId(),
-                "status", order.getStatus().name(),
-                "from_account", order.getFromAccount(),
-                "to_account", order.getToAccount(),
-                "amount", order.getAmount(),
-                "currency", order.getCurrency(),
-                "created_at", order.getCreatedAt().toString()
-        ));
+        return ResponseEntity.ok(toPaymentResponse(order));
     }
 
     /**
      * 查询退款列表
      */
     @GetMapping("/{paymentId}/refunds")
-    public ResponseEntity<List<Map<String, Object>>> listRefunds(@PathVariable String paymentId) {
-        List<Map<String, Object>> refunds = refundOrderRepository.findByPaymentId(paymentId).stream()
-                .map(r -> {
-                    Map<String, Object> m = new java.util.LinkedHashMap<>();
-                    m.put("refund_id", r.getRefundId());
-                    m.put("payment_id", r.getPaymentId());
-                    m.put("amount", r.getAmount());
-                    m.put("reason", r.getReason());
-                    m.put("status", r.getStatus().name());
-                    m.put("created_at", r.getCreatedAt().toString());
-                    m.put("completed_at", r.getCompletedAt() != null ? r.getCompletedAt().toString() : null);
-                    return m;
-                })
+    public ResponseEntity<List<RefundDetailResponse>> listRefunds(@PathVariable String paymentId) {
+        List<RefundDetailResponse> refunds = refundService.listRefunds(paymentId).stream()
+                .map(r -> new RefundDetailResponse(
+                        r.getRefundId(),
+                        r.getPaymentId(),
+                        r.getAmount(),
+                        r.getReason(),
+                        r.getStatus().name(),
+                        r.getCreatedAt().toString(),
+                        r.getCompletedAt() != null ? r.getCompletedAt().toString() : null
+                ))
                 .toList();
         return ResponseEntity.ok(refunds);
     }
@@ -117,18 +92,18 @@ public class PaymentController {
      * 发起退款
      */
     @PostMapping("/{paymentId}/refund")
-    public ResponseEntity<Map<String, Object>> refund(
+    public ResponseEntity<RefundResponse> refund(
             @PathVariable String paymentId,
             @RequestHeader("Idempotency-Key") String idempotencyKey,
             @RequestBody RefundRequest request) {
 
         var refund = refundService.createRefund(paymentId, idempotencyKey, request);
 
-        return ResponseEntity.status(HttpStatus.CREATED).body(Map.of(
-                "refund_id", refund.getRefundId(),
-                "payment_id", paymentId,
-                "status", refund.getStatus().name(),
-                "amount", refund.getAmount()
+        return ResponseEntity.status(HttpStatus.CREATED).body(new RefundResponse(
+                refund.getRefundId(),
+                paymentId,
+                refund.getStatus().name(),
+                refund.getAmount()
         ));
     }
 
@@ -148,4 +123,18 @@ public class PaymentController {
             Long amount,
             String reason
     ) {}
+
+    // --- Helpers ---
+
+    private static PaymentResponse toPaymentResponse(PaymentOrder order) {
+        return new PaymentResponse(
+                order.getPaymentId(),
+                order.getStatus().name(),
+                order.getFromAccount(),
+                order.getToAccount(),
+                order.getAmount(),
+                order.getCurrency(),
+                order.getCreatedAt().toString()
+        );
+    }
 }
