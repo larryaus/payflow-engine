@@ -49,7 +49,7 @@ func consumeTopic(ctx context.Context, topic string) {
 		MinBytes:       1,
 		MaxBytes:       10e6, // 10 MB
 		CommitInterval: time.Second,
-		StartOffset:    kafka.LastOffset,
+		StartOffset:    kafka.FirstOffset,
 	})
 	defer func() {
 		if err := reader.Close(); err != nil {

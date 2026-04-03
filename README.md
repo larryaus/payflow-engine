@@ -90,7 +90,7 @@ Request:
   "callback_url": "https://merchant.com/webhook/payment"
 }
 
-Response 201:
+Response 201 Created:
 {
   "payment_id": "PAY_20260322_abcdef",
   "status": "PENDING",
@@ -128,7 +128,7 @@ Request:
   "reason": "商品退货"
 }
 
-Response 201:
+Response 201 Created:
 {
   "refund_id": "REF_20260322_xyz",
   "payment_id": "PAY_20260322_abcdef",
@@ -137,7 +137,44 @@ Response 201:
 }
 ```
 
-### 3.4 账户余额查询
+### 3.4 查询退款列表
+
+```
+GET /api/v1/payments/{payment_id}/refunds
+
+Response 200:
+[
+  {
+    "refund_id": "REF_20260322_xyz",
+    "payment_id": "PAY_20260322_abcdef",
+    "amount": 5000,
+    "reason": "商品退货",
+    "status": "COMPLETED",
+    "created_at": "2026-03-22T10:01:00Z",
+    "completed_at": "2026-03-22T10:01:30Z"
+  }
+]
+```
+
+### 3.5 账户列表
+
+```
+GET /api/v1/accounts
+
+Response 200:
+[
+  {
+    "account_id": "ACC_001",
+    "account_name": "测试账户1",
+    "available_balance": 500000,
+    "frozen_balance": 0,
+    "currency": "CNY",
+    "updated_at": "2026-03-22T10:00:00Z"
+  }
+]
+```
+
+### 3.6 账户余额查询
 
 ```
 GET /api/v1/accounts/{account_id}/balance
@@ -195,6 +232,8 @@ Client          Nginx           PaymentSvc      RiskSvc     Temporal       Accou
   │               │                │               │             │ markFailed   │             │             │             │
 ```
 
+**失败补偿（Saga）：** 若步骤 4/5 失败，按逆序补偿：reverseEntry → unfreezeAmount → 状态标记 FAILED → 发布 payment.failed。
+
 ### 4.1 支付状态机
 
 ```
@@ -203,15 +242,16 @@ Client          Nginx           PaymentSvc      RiskSvc     Temporal       Accou
                 └────┬─────┘
                      │ 风控通过
                      ▼
-                ┌──────────┐    风控拒绝    ┌──────────┐
-                │ PENDING  │───────────────>│ REJECTED │
-                └────┬─────┘               └──────────┘
-                     │ 冻结成功
+                ┌──────────┐    风控拒绝(sync)  ┌──────────┐
+                │ PENDING  │──────────────────>│ REJECTED │
+                └────┬─────┘                  └──────────┘
+      (CREATED也可→REJECTED)
+                     │ Kafka消费触发
                      ▼
                 ┌──────────────┐
                 │ PROCESSING   │
                 └────┬────┬────┘
-          转账成功   │    │ 转账失败
+          转账成功   │    │ 转账失败(+Saga补偿)
                      ▼    ▼
             ┌───────────┐ ┌──────────┐
             │ COMPLETED │ │  FAILED  │
@@ -219,7 +259,7 @@ Client          Nginx           PaymentSvc      RiskSvc     Temporal       Accou
                   │ 发起退款
                   ▼
             ┌───────────┐
-            │ REFUNDED  │ (全额/部分)
+            │ REFUNDED  │ (全额/部分, RefundStatus: PROCESSING→COMPLETED/FAILED)
             └───────────┘
 ```
 
@@ -318,9 +358,13 @@ Temporal Workflow 配置:
 ├── Activity 重试: maxAttempts=3, scheduleToCloseTimeout=30s
 └── Saga 补偿: 任意步骤失败 → 自动解冻资金
 
-Kafka 仅用于最终通知广播:
-├── notification.send   (触发 Webhook 回调)
-└── risk.alert
+Kafka Topic 设计:
+├── payment.completed   (Producer: payment-service)
+├── payment.failed      (Producer: payment-service)
+└── notification.send   (Consumer: notification-service)
+
+注意: ledger.entry 和 risk.alert 在代码中并不存在。
+账务操作通过同步 Feign 调用 ledger-service 完成，非 Kafka。
 ```
 
 ---
@@ -437,32 +481,52 @@ payflow-engine/
 │   └── src/main/java/com/payflow/payment/
 │       ├── PaymentApplication.java
 │       ├── controller/
-│       │   └── PaymentController.java          # REST API 入口
+│       │   └── PaymentController.java          # REST API 入口 (含 request record DTOs)
 │       ├── service/
 │       │   ├── PaymentService.java             # 启动 Temporal Workflow
-│       │   └── RefundService.java              # 退款逻辑
+│       │   ├── RefundService.java              # 退款逻辑
+│       │   └── pipeline/
+│       │       ├── PaymentCreationPipeline.java # 流水线编排器
+│       │       ├── PaymentCreationContext.java  # 流水线上下文(含 shortCircuit)
+│       │       ├── PaymentCreationStep.java     # Step 接口
+│       │       └── step/
+│       │           ├── IdempotencyStep.java     # Step1: 幂等占位
+│       │           ├── OrderPersistStep.java    # Step2: 订单持久化
+│       │           ├── RiskCheckStep.java       # Step3: 风控检查
+│       │           └── EventPublishStep.java    # Step4: 事件发布
 │       ├── workflow/
 │       │   ├── PaymentWorkflow.java            # Workflow 接口
 │       │   ├── PaymentWorkflowImpl.java        # Workflow 实现 (Saga 编排)
 │       │   ├── PaymentActivities.java          # Activity 接口 (9个步骤)
 │       │   ├── PaymentActivitiesImpl.java      # Activity 实现 (Feign + Kafka)
 │       │   └── PaymentWorkflowInput.java       # Workflow 输入 DTO
+│       ├── dto/
+│       │   ├── CreatePaymentResponse.java
+│       │   ├── PaymentResponse.java
+│       │   ├── PaymentListResponse.java
+│       │   ├── RefundResponse.java
+│       │   └── RefundDetailResponse.java
 │       ├── domain/
 │       │   ├── PaymentOrder.java               # 支付订单实体
-│       │   ├── PaymentStatus.java              # 状态枚举(含状态机)
+│       │   ├── PaymentStatus.java              # 状态枚举(含状态机 canTransitTo)
 │       │   ├── RefundOrder.java                # 退款实体
-│       │   └── RefundStatus.java               # 退款状态枚举
+│       │   └── RefundStatus.java               # 退款状态枚举(PROCESSING/COMPLETED/FAILED)
 │       ├── repository/
 │       │   ├── PaymentOrderRepository.java
 │       │   └── RefundOrderRepository.java
 │       ├── client/
 │       │   ├── AccountClient.java              # Feign → account-service
+│       │   ├── AccountClientFallbackFactory.java # 熔断降级
 │       │   ├── RiskClient.java                 # Feign → risk-service
-│       │   └── LedgerClient.java               # Feign → ledger-service
+│       │   ├── RiskClientFallbackFactory.java  # 熔断降级
+│       │   ├── LedgerClient.java               # Feign → ledger-service
+│       │   └── LedgerClientFallbackFactory.java # 熔断降级
 │       ├── mq/
 │       │   └── PaymentEventProducer.java       # Kafka 生产者(通知广播)
 │       ├── config/
 │       │   ├── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
+│       │   ├── KafkaConfig.java                # Kafka 配置
+│       │   ├── WebConfig.java                  # Web 配置
 │       │   └── TemporalConfig.java             # Temporal Worker + WorkflowClient
 │       └── exception/
 │           ├── PaymentException.java
@@ -518,7 +582,8 @@ payflow-engine/
     ├── 001_create_payment_order.sql
     ├── 002_create_account.sql
     ├── 003_create_ledger_entry.sql
-    └── 004_create_refund_order.sql
+    ├── 004_create_refund_order.sql
+    └── 005_seed_accounts.sql       # 测试账户种子数据 (acc001-acc004)
 ```
 
 ---
@@ -733,7 +798,10 @@ curl -X POST http://localhost:8081/api/v1/payments \
 # 3. 查询支付状态
 curl http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX
 
-# 4. 查询账户余额
+# 4. 查询账户列表
+curl http://localhost:8082/api/v1/accounts
+
+# 5. 查询账户余额
 curl http://localhost:8082/api/v1/accounts/ACC_001/balance
 
 # 5. 发起退款

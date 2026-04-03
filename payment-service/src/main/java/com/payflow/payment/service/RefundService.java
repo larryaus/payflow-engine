@@ -12,6 +12,8 @@ import com.payflow.payment.exception.PaymentException;
 import com.payflow.payment.mq.PaymentEventProducer;
 import com.payflow.payment.repository.PaymentOrderRepository;
 import com.payflow.payment.repository.RefundOrderRepository;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -20,12 +22,16 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class RefundService {
 
     private static final Logger log = LoggerFactory.getLogger(RefundService.class);
+
+    private static final String REFUND_LOCK_PREFIX = "refund:lock:";
 
     private final PaymentOrderRepository paymentOrderRepository;
     private final RefundOrderRepository refundOrderRepository;
@@ -33,6 +39,7 @@ public class RefundService {
     private final AccountClient accountClient;
     private final LedgerClient ledgerClient;
     private final PaymentEventProducer eventProducer;
+    private final RedissonClient redissonClient;
 
     public RefundService(
             PaymentOrderRepository paymentOrderRepository,
@@ -40,13 +47,15 @@ public class RefundService {
             IdempotencyFilter idempotencyFilter,
             AccountClient accountClient,
             LedgerClient ledgerClient,
-            PaymentEventProducer eventProducer) {
+            PaymentEventProducer eventProducer,
+            RedissonClient redissonClient) {
         this.paymentOrderRepository = paymentOrderRepository;
         this.refundOrderRepository = refundOrderRepository;
         this.idempotencyFilter = idempotencyFilter;
         this.accountClient = accountClient;
         this.ledgerClient = ledgerClient;
         this.eventProducer = eventProducer;
+        this.redissonClient = redissonClient;
     }
 
     @Transactional
@@ -56,24 +65,45 @@ public class RefundService {
                     .orElseThrow(() -> new PaymentException("IDEMPOTENCY_CONFLICT", "Duplicate refund request"));
         }
 
-        PaymentOrder payment = paymentOrderRepository.findByPaymentId(paymentId)
-                .orElseThrow(() -> new PaymentException("NOT_FOUND", "Payment not found"));
+        RLock lock = redissonClient.getLock(REFUND_LOCK_PREFIX + paymentId);
+        RefundOrder refund;
+        PaymentOrder payment;
+        try {
+            if (!lock.tryLock(5, 30, TimeUnit.SECONDS)) {
+                throw new PaymentException("PAYMENT_BUSY", "Payment is being processed, please retry");
+            }
 
-        if (payment.getStatus() != PaymentStatus.COMPLETED) {
-            throw new PaymentException("INVALID_STATUS", "Only completed payments can be refunded");
+            // Re-read inside the lock so we see the latest committed state
+            payment = paymentOrderRepository.findByPaymentId(paymentId)
+                    .orElseThrow(() -> new PaymentException("NOT_FOUND", "Payment not found"));
+
+            if (payment.getStatus() != PaymentStatus.COMPLETED) {
+                throw new PaymentException("INVALID_STATUS", "Only completed payments can be refunded");
+            }
+
+            if (request.amount() > payment.getAmount()) {
+                throw new PaymentException("INVALID_AMOUNT", "Refund amount exceeds payment amount");
+            }
+
+            refund = buildRefundOrder(paymentId, idempotencyKey, request);
+            refundOrderRepository.save(refund);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new PaymentException("PAYMENT_BUSY", "Lock interrupted, please retry");
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
-
-        if (request.amount() > payment.getAmount()) {
-            throw new PaymentException("INVALID_AMOUNT", "Refund amount exceeds payment amount");
-        }
-
-        RefundOrder refund = buildRefundOrder(paymentId, idempotencyKey, request);
-        refundOrderRepository.save(refund);
 
         executeRefundSaga(refund, payment, request);
 
         refundOrderRepository.save(refund);
         return refund;
+    }
+
+    public List<RefundOrder> listRefunds(String paymentId) {
+        return refundOrderRepository.findByPaymentId(paymentId);
     }
 
     // --- Saga orchestration ---
