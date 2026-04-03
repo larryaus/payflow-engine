@@ -8,6 +8,10 @@ import com.payflow.payment.dto.RefundDetailResponse;
 import com.payflow.payment.dto.RefundResponse;
 import com.payflow.payment.service.PaymentService;
 import com.payflow.payment.service.RefundService;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import org.springframework.data.domain.Page;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -33,7 +37,7 @@ public class PaymentController {
     @PostMapping
     public ResponseEntity<CreatePaymentResponse> createPayment(
             @RequestHeader("Idempotency-Key") String idempotencyKey,
-            @jakarta.validation.Valid @RequestBody CreatePaymentRequest request) {
+            @Valid @RequestBody CreatePaymentRequest request) {
 
         PaymentOrder order = paymentService.createPayment(idempotencyKey, request);
 
@@ -98,7 +102,7 @@ public class PaymentController {
     public ResponseEntity<RefundResponse> refund(
             @PathVariable String paymentId,
             @RequestHeader("Idempotency-Key") String idempotencyKey,
-            @jakarta.validation.Valid @RequestBody RefundRequest request) {
+            @Valid @RequestBody RefundRequest request) {
 
         var refund = refundService.createRefund(paymentId, idempotencyKey, request);
 
@@ -113,17 +117,17 @@ public class PaymentController {
     // --- Request DTOs ---
 
     public record CreatePaymentRequest(
-            @jakarta.validation.constraints.NotBlank String from_account,
-            @jakarta.validation.constraints.NotBlank String to_account,
-            @jakarta.validation.constraints.NotNull @jakarta.validation.constraints.Min(1) Long amount,
-            @jakarta.validation.constraints.NotBlank String currency,
-            @jakarta.validation.constraints.NotBlank String payment_method,
+            @NotBlank String from_account,
+            @NotBlank String to_account,
+            @NotNull @Min(1) Long amount,
+            @NotBlank String currency,
+            @NotBlank String payment_method,
             String memo,
             String callback_url
     ) {}
 
     public record RefundRequest(
-            @jakarta.validation.constraints.NotNull @jakarta.validation.constraints.Min(1) Long amount,
+            @NotNull @Min(1) Long amount,
             String reason
     ) {}
 
