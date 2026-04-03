@@ -8,48 +8,35 @@ PayFlow Engine is a **polyglot microservices payment platform** simulating a fin
 
 ## Architecture
 
-Six services communicate via REST (sync) and Kafka (async):
+Six services communicate via REST (sync), with Temporal orchestrating the async payment workflow:
 
 | Service | Language/Framework | Port | Role |
 |---|---|---|---|
-| `payment-service` | Java 21 + Spring Boot 3 | 8081 | Orchestrator — accepts payments, coordinates flow |
+| `payment-service` | Java 21 + Spring Boot 3 | 8081 | Orchestrator — accepts payments, starts Temporal workflow |
 | `account-service` | Java 21 + Spring Boot 3 | 8082 | Balance management — freeze/transfer/unfreeze |
 | `ledger-service` | Java 21 + Spring Boot 3 | 8083 | Double-entry accounting records |
 | `risk-service` | Python 3.12 + FastAPI | 8084 | Policy enforcement — blacklist, amount limits |
 | `notification-service` | Go 1.22 | 8085 | Event-driven webhook/notification delivery |
 | `frontend` | React 18 + TypeScript + Vite | 3000 | SPA — payments UI |
 
-**Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6 — KRaft mode, no ZooKeeper), Nginx
+**Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6), Nginx, Temporal 1.24
 
 **Rate limiting:** Nginx (`frontend/nginx.conf`) — `limit_req_zone` 10r/s per IP, burst=20, applies to all `/api/*` routes, returns 429 on exceed.
 
-### Payment Flow (Sync → Async)
-
-**Synchronous path (returns 201 Created):**
+### Payment Flow (Sync → Temporal Workflow)
 ```
-Client → Payment Service
-       → IdempotencyStep  (Redis SETNX, 24h TTL; short-circuit on duplicate)
-       → OrderPersistStep (create PaymentOrder, status=CREATED)
-       → RiskCheckStep    (sync Feign → Risk Service; PASS→PENDING, FAIL→REJECTED+exception)
-       → EventPublishStep (publish payment.created to Kafka)
-       → Return 201 Created
-```
+Client → Payment Service → Redis (idempotency check) → Risk Service (sync)
+       → Start Temporal Workflow (async) → Return 202 Accepted
 
-**Asynchronous path (triggered by payment.created Kafka event):**
-```
-Kafka consumer (payment.created)
-       → Acquire Redisson lock on fromAccount (tryLock 5s, hold max 30s)
-       → status → PROCESSING
-       → Account Service: freeze amount
-       → Ledger Service:  create double-entry record
-       → Account Service: transfer (debit frozen → credit to_account)
-       → status → COMPLETED, publish payment.completed
-       → Notification Service: webhook callback
+Temporal PaymentWorkflow (task queue: payment-workflow-queue):
+  1. markProcessing     — update payment status
+  2. freezeAmount       — hold funds on source account
+  3. createLedgerEntry  — double-entry bookkeeping
+  4. transfer           — execute fund movement
+  5. markCompleted      — update payment status
+  6. sendNotification   — publish to Kafka → Notification Service (webhook)
 
-On failure → Saga compensation (reverse order):
-       → reverseEntry (if ledger was created)
-       → unfreezeAmount (if account was frozen)
-       → status → FAILED, publish payment.failed
+On failure: unfreezeAmount (Saga compensation) → markFailed → sendFailedNotification
 ```
 
 ---
@@ -61,16 +48,22 @@ payflow-engine/
 ├── payment-service/          # Java Spring Boot — payment orchestration
 │   └── src/main/java/com/payflow/payment/
 │       ├── controller/       # REST endpoints + request record DTOs
-│       ├── service/          # PaymentService, RefundService
+│       ├── service/          # PaymentService (starts Temporal workflow), RefundService
 │       │   └── pipeline/     # PaymentCreationPipeline + steps
 │       │       └── step/     # IdempotencyStep, OrderPersistStep, RiskCheckStep, EventPublishStep
+│       ├── workflow/         # Temporal workflow + activities
+│       │   ├── PaymentWorkflow.java         # Workflow interface
+│       │   ├── PaymentWorkflowImpl.java     # Saga orchestration logic
+│       │   ├── PaymentActivities.java       # Activity interface (9 steps)
+│       │   ├── PaymentActivitiesImpl.java   # Activity implementations
+│       │   └── PaymentWorkflowInput.java    # Workflow input DTO
 │       ├── dto/              # Response DTOs (CreatePaymentResponse, PaymentResponse, etc.)
 │       ├── domain/           # JPA entities + state machine (PaymentStatus, RefundStatus)
 │       ├── repository/       # Spring Data JPA repos
 │       ├── client/           # Feign clients + FallbackFactory (AccountClient, RiskClient, LedgerClient)
-│       ├── config/           # IdempotencyFilter, KafkaConfig, WebConfig
+│       ├── config/           # IdempotencyFilter, KafkaConfig, WebConfig, TemporalConfig
 │       ├── exception/        # PaymentException, GlobalExceptionHandler
-│       └── mq/               # PaymentEventProducer, PaymentEventConsumer
+│       └── mq/               # PaymentEventProducer (notification broadcast only)
 │   └── src/main/resources/
 │       └── application.yml   # Resilience4j circuit breaker config
 ├── account-service/          # Java Spring Boot — balance management
@@ -128,8 +121,8 @@ payflow-engine/
 # Start everything (all services + infra)
 docker-compose up -d
 
-# Start infrastructure only (postgres, redis, kafka)
-docker-compose up -d postgres redis kafka
+# Start infrastructure only (postgres, redis, kafka, temporal)
+docker-compose up -d postgres redis kafka temporal temporal-ui
 ```
 
 ### Running Individual Services
@@ -196,9 +189,11 @@ go build ./...
 - **Inter-service calls:** Use Feign clients in the `client/` package, not raw HTTP
 - **Feign resilience:** Each Feign client has a paired `*FallbackFactory` for Resilience4j circuit breaker fallback — register fallbacks when adding new clients
 - **Circuit breaker:** Configured in `payment-service/src/main/resources/application.yml` — sliding window 10, failure threshold 50%, open wait 30s
-- **Kafka topics published** via `PaymentEventProducer`: `payment.created` (partitioned by `from_account`), `payment.completed`, `payment.failed`. Note: `ledger.entry` and `risk.alert` do NOT exist — ledger operations use synchronous REST calls, not Kafka
-- **Kafka topics consumed** by notification-service: `payment.completed`, `payment.failed`, `notification.send`
+- **Kafka:** Publish via `PaymentEventProducer` — topics: `payment.completed`, `payment.failed`, `notification.send`. Note: `ledger.entry` and `risk.alert` do NOT exist — ledger operations use synchronous Feign calls, not Kafka
 - **Response DTOs:** Controllers return DTO objects from the `dto/` package — do not return raw entities
+- **Temporal workflows:** Use `WorkflowClient` from `TemporalConfig` to start workflows — task queue `payment-workflow-queue`, workflow ID format `payment-{paymentId}`
+- **Temporal activities:** Implement in `PaymentActivitiesImpl` — call Feign clients directly; retries (max 3) and timeouts (30s) are configured in `PaymentWorkflowImpl`
+- **Saga compensation:** On activity failure, `PaymentWorkflowImpl` calls `unfreezeAmount` before marking payment FAILED — never skip this
 
 ### Payment Creation Pipeline
 
@@ -208,11 +203,7 @@ Payment creation is orchestrated by `PaymentCreationPipeline` which runs steps i
 IdempotencyStep → OrderPersistStep → RiskCheckStep → EventPublishStep
 ```
 
-Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting into the pipeline constructor in order.
-
-### Saga Compensation
-
-`processPaymentAsync` (triggered by `payment.created` Kafka event) tracks boolean flags (`froze`, `ledgerCreated`) to know which operations succeeded. On failure, `compensate()` reverses in reverse order — ledger reversal first, then unfreeze. Each compensation step has independent try-catch so one failure does not abort the rest. Manual intervention is logged if compensation itself fails.
+After the pipeline completes, `PaymentService` starts a Temporal workflow for async fulfillment. Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting into the pipeline constructor in order.
 
 ### TypeScript / React (Frontend)
 
@@ -275,8 +266,8 @@ FAILED / REJECTED / REFUNDED → (terminal, no transitions)
 ```
 Always use `order.transitTo(target)` — never assign status directly.
 
-### 5. Event-Driven Async Processing
-Payment acceptance (201) is decoupled from fulfillment. The pipeline publishes `payment.created` and returns immediately — downstream processing (freeze, ledger, transfer, notifications) happens asynchronously via Kafka.
+### 5. Temporal Workflow Orchestration (Saga Pattern)
+Payment acceptance (202) is decoupled from fulfillment. After risk check, payment-service starts a Temporal workflow and returns immediately. The workflow orchestrates all downstream steps as activities (freeze → ledger → transfer → complete). On any activity failure, the workflow runs compensation (`unfreezeAmount`) before marking the payment FAILED. Workflow ID `payment-{paymentId}` ensures at-most-once execution. Monitor workflow executions at http://localhost:8088 (Temporal UI).
 
 ### 6. Circuit Breaker (Resilience4j)
 All Feign clients in payment-service have circuit breakers configured in `application.yml`. Each client also has a `*FallbackFactory` that throws `PaymentException("SERVICE_UNAVAILABLE", ...)` when the circuit is open. This prevents cascade failures.

@@ -83,4 +83,13 @@ public class Account {
         this.availableBalance += amount;
         this.updatedAt = Instant.now();
     }
+
+    /** 退款扣除: 从可用余额中扣除(用于转账逆向补偿) */
+    public void deductAvailable(Long amount) {
+        if (availableBalance < amount) {
+            throw new IllegalStateException("Insufficient available balance for deduction");
+        }
+        this.availableBalance -= amount;
+        this.updatedAt = Instant.now();
+    }
 }
