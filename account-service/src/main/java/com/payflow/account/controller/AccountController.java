@@ -51,6 +51,9 @@ public class AccountController {
     public ResponseEntity<Void> freeze(
             @RequestParam("account_id") String accountId,
             @RequestParam("amount") Long amount) {
+        if (amount == null || amount <= 0) {
+            throw new IllegalStateException("Amount must be positive");
+        }
         accountService.freezeAmount(accountId, amount);
         return ResponseEntity.ok().build();
     }
@@ -59,6 +62,9 @@ public class AccountController {
     public ResponseEntity<Void> unfreeze(
             @RequestParam("account_id") String accountId,
             @RequestParam("amount") Long amount) {
+        if (amount == null || amount <= 0) {
+            throw new IllegalStateException("Amount must be positive");
+        }
         accountService.unfreezeAmount(accountId, amount);
         return ResponseEntity.ok().build();
     }
@@ -68,6 +74,12 @@ public class AccountController {
             @RequestParam("from_account") String fromAccount,
             @RequestParam("to_account") String toAccount,
             @RequestParam("amount") Long amount) {
+        if (amount == null || amount <= 0) {
+            throw new IllegalStateException("Amount must be positive");
+        }
+        if (fromAccount.equals(toAccount)) {
+            throw new IllegalStateException("Cannot transfer to the same account");
+        }
         accountService.transfer(fromAccount, toAccount, amount);
         return ResponseEntity.ok().build();
     }

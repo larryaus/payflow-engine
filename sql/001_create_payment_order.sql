@@ -16,4 +16,5 @@ CREATE TABLE payment_order (
 );
 
 CREATE INDEX idx_payment_from_account ON payment_order(from_account, created_at);
+CREATE INDEX idx_payment_to_account ON payment_order(to_account, created_at);
 CREATE INDEX idx_payment_status ON payment_order(status);

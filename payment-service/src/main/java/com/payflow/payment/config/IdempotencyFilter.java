@@ -59,9 +59,11 @@ public class IdempotencyFilter {
     }
 
     /**
-     * 兼容旧接口 — 等同于 !tryAcquire()
+     * 只读检查 key 是否已存在（不修改 Redis 状态）
+     * 避免原来 !tryAcquire() 的副作用导致竞态条件
      */
     public boolean isDuplicate(String idempotencyKey) {
-        return !tryAcquire(idempotencyKey);
+        String value = redisTemplate.opsForValue().get(KEY_PREFIX + idempotencyKey);
+        return value != null;
     }
 }

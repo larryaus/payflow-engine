@@ -33,7 +33,7 @@ public class PaymentController {
     @PostMapping
     public ResponseEntity<CreatePaymentResponse> createPayment(
             @RequestHeader("Idempotency-Key") String idempotencyKey,
-            @RequestBody CreatePaymentRequest request) {
+            @jakarta.validation.Valid @RequestBody CreatePaymentRequest request) {
 
         PaymentOrder order = paymentService.createPayment(idempotencyKey, request);
 
@@ -51,6 +51,9 @@ public class PaymentController {
     public ResponseEntity<PaymentListResponse> listPayments(
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int size) {
+
+        if (page < 1) page = 1;
+        if (size < 1 || size > 100) size = 20;
 
         Page<PaymentOrder> result = paymentService.listPayments(page, size);
         List<PaymentResponse> items = result.getContent().stream()
@@ -95,7 +98,7 @@ public class PaymentController {
     public ResponseEntity<RefundResponse> refund(
             @PathVariable String paymentId,
             @RequestHeader("Idempotency-Key") String idempotencyKey,
-            @RequestBody RefundRequest request) {
+            @jakarta.validation.Valid @RequestBody RefundRequest request) {
 
         var refund = refundService.createRefund(paymentId, idempotencyKey, request);
 
@@ -110,17 +113,17 @@ public class PaymentController {
     // --- Request DTOs ---
 
     public record CreatePaymentRequest(
-            String from_account,
-            String to_account,
-            Long amount,
-            String currency,
-            String payment_method,
+            @jakarta.validation.constraints.NotBlank String from_account,
+            @jakarta.validation.constraints.NotBlank String to_account,
+            @jakarta.validation.constraints.NotNull @jakarta.validation.constraints.Min(1) Long amount,
+            @jakarta.validation.constraints.NotBlank String currency,
+            @jakarta.validation.constraints.NotBlank String payment_method,
             String memo,
             String callback_url
     ) {}
 
     public record RefundRequest(
-            Long amount,
+            @jakarta.validation.constraints.NotNull @jakarta.validation.constraints.Min(1) Long amount,
             String reason
     ) {}
 

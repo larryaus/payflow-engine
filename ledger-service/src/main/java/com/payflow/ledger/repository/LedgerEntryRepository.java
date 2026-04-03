@@ -12,9 +12,9 @@ public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, Long> 
 
     List<LedgerEntry> findByPaymentId(String paymentId);
 
-    @Query("SELECT SUM(e.amount) FROM LedgerEntry e WHERE e.entryType = 'DEBIT' AND e.status = 'COMPLETED'")
-    Long sumAllDebits();
+    @Query("SELECT COALESCE(SUM(e.amount), 0) FROM LedgerEntry e WHERE e.entryType = 'PAYMENT' AND e.status = 'COMPLETED'")
+    Long sumAllPayments();
 
-    @Query("SELECT SUM(e.amount) FROM LedgerEntry e WHERE e.entryType = 'CREDIT' AND e.status = 'COMPLETED'")
-    Long sumAllCredits();
+    @Query("SELECT COALESCE(SUM(e.amount), 0) FROM LedgerEntry e WHERE e.entryType = 'REVERSAL' AND e.status = 'COMPLETED'")
+    Long sumAllReversals();
 }
