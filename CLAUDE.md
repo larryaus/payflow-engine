@@ -111,7 +111,8 @@ payflow-engine/
 │   ├── 001_create_payment_order.sql
 │   ├── 002_create_account.sql
 │   ├── 003_create_ledger_entry.sql
-│   └── 004_create_refund_order.sql
+│   ├── 004_create_refund_order.sql
+│   └── 005_seed_accounts.sql # Test accounts (acc001–acc004)
 ├── .github/workflows/        # CI (ci.yml) and CD (cd.yml) workflows
 ├── .husky/                   # Git hooks (pre-commit linting)
 ├── docker-compose.yml        # Full stack local orchestration
@@ -195,7 +196,8 @@ go build ./...
 - **Inter-service calls:** Use Feign clients in the `client/` package, not raw HTTP
 - **Feign resilience:** Each Feign client has a paired `*FallbackFactory` for Resilience4j circuit breaker fallback — register fallbacks when adding new clients
 - **Circuit breaker:** Configured in `payment-service/src/main/resources/application.yml` — sliding window 10, failure threshold 50%, open wait 30s
-- **Kafka topics:** Publish via `PaymentEventProducer` — `payment.created`, `payment.completed`, `payment.failed`, `ledger.entry`, `notification.send`, `risk.alert`
+- **Kafka topics published** via `PaymentEventProducer`: `payment.created` (partitioned by `from_account`), `payment.completed`, `payment.failed`. Note: `ledger.entry` and `risk.alert` do NOT exist — ledger operations use synchronous REST calls, not Kafka
+- **Kafka topics consumed** by notification-service: `payment.completed`, `payment.failed`, `notification.send`
 - **Response DTOs:** Controllers return DTO objects from the `dto/` package — do not return raw entities
 
 ### Payment Creation Pipeline
@@ -246,6 +248,7 @@ Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting
 - **Amounts:** Stored as `BIGINT` — never `DECIMAL`/`FLOAT`
 - **IDs:** Use UUIDs for business IDs (payment_id, account_id, etc.), auto-increment `id` as PK
 - **Migrations:** Add new SQL files numerically prefixed in `sql/` — they run in order at container startup
+- **Seed data:** `005_seed_accounts.sql` seeds test accounts `acc001`–`acc004` for local development
 - **Credentials (local):** user=`payflow`, password=`payflow_secret`, database=`payflow`
 
 ---

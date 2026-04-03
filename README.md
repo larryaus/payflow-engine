@@ -350,12 +350,13 @@ limit_req_status 429;
 异步链路(后台处理): 分录记账 → 实际转账 → 解冻 → 通知
 
 Kafka Topic 设计:
-├── payment.created     (Partition by account_id, 保证同账户顺序)
-├── payment.completed
-├── payment.failed
-├── ledger.entry
-├── notification.send
-└── risk.alert
+├── payment.created     (Producer: payment-service; 按 from_account 分区，保证同账户顺序)
+├── payment.completed   (Producer: payment-service)
+├── payment.failed      (Producer: payment-service)
+└── notification.send   (Consumer: notification-service)
+
+注意: ledger.entry 和 risk.alert 在代码中并不存在。
+账务操作通过同步 REST 调用 ledger-service 完成，非 Kafka。
 ```
 
 ---
@@ -567,7 +568,8 @@ payflow-engine/
     ├── 001_create_payment_order.sql
     ├── 002_create_account.sql
     ├── 003_create_ledger_entry.sql
-    └── 004_create_refund_order.sql
+    ├── 004_create_refund_order.sql
+    └── 005_seed_accounts.sql       # 测试账户种子数据 (acc001-acc004)
 ```
 
 ---
