@@ -33,7 +33,8 @@ public class PaymentEventConsumer {
             log.info("Received payment.created event: {}", paymentId);
             paymentService.processPaymentAsync(paymentId);
         } catch (Exception e) {
-            log.error("Failed to process payment.created message: {}", e.getMessage());
+            log.error("Failed to process payment.created message, will retry: {}", e.getMessage());
+            throw new RuntimeException("payment.created processing failed", e);
         }
     }
 }
