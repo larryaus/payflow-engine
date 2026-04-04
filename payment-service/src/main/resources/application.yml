@@ -4,6 +4,15 @@ spring:
       circuitbreaker:
         enabled: true
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,env
+  endpoint:
+    health:
+      show-details: always
+
 resilience4j:
   circuitbreaker:
     configs:

@@ -6,6 +6,7 @@ import PaymentListPage from './pages/PaymentListPage';
 import PaymentCreatePage from './pages/PaymentCreatePage';
 import PaymentDetailPage from './pages/PaymentDetailPage';
 import AccountPage from './pages/AccountPage';
+import AuditPage from './pages/AuditPage';
 
 function App() {
   return (
@@ -17,6 +18,7 @@ function App() {
           <Route path="payments/create" element={<PaymentCreatePage />} />
           <Route path="payments/:paymentId" element={<PaymentDetailPage />} />
           <Route path="accounts" element={<AccountPage />} />
+          <Route path="audit" element={<AuditPage />} />
         </Route>
       </Routes>
     </ConfigProvider>
