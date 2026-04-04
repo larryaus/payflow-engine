@@ -47,6 +47,9 @@ public class PaymentOrder {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt = Instant.now();
 
+    @Version
+    private Long version = 0L;
+
     @Column(name = "completed_at")
     private Instant completedAt;
 
@@ -75,6 +78,7 @@ public class PaymentOrder {
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
+    public Long getVersion() { return version; }
     public Instant getCompletedAt() { return completedAt; }
     public void setCompletedAt(Instant completedAt) { this.completedAt = completedAt; }
 
