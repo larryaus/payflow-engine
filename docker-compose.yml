@@ -95,13 +95,34 @@ services:
     depends_on:
       - kafka
 
+  gateway-service:
+    build: ./gateway-service
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_PORT: "8080"
+      SPRING_REDIS_HOST: redis
+      JWT_SECRET: payflow-default-secret-key-change-in-production-32chars!
+      JWT_ENABLED: "true"
+      SERVICES_PAYMENT_URL: http://payment-service:8081
+      SERVICES_ACCOUNT_URL: http://account-service:8082
+      SERVICES_LEDGER_URL: http://ledger-service:8083
+      SERVICES_RISK_URL: http://risk-service:8084
+      SERVICES_NOTIFICATION_URL: http://notification-service:8085
+    depends_on:
+      - redis
+      - payment-service
+      - account-service
+      - ledger-service
+      - risk-service
+      - notification-service
+
   frontend:
     build: ./frontend
     ports:
       - "3000:80"
     depends_on:
-      - payment-service
-      - account-service
+      - gateway-service
 
 volumes:
   pgdata:

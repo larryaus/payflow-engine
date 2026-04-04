@@ -1,0 +1,51 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: gateway-service
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 10
+            redis-rate-limiter.burstCapacity: 20
+            redis-rate-limiter.requestedTokens: 1
+            key-resolver: "#{@ipKeyResolver}"
+      routes:
+        - id: payment-service
+          uri: ${SERVICES_PAYMENT_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/payments/**
+        - id: account-service
+          uri: ${SERVICES_ACCOUNT_URL:http://localhost:8082}
+          predicates:
+            - Path=/api/v1/accounts/**
+        - id: ledger-service
+          uri: ${SERVICES_LEDGER_URL:http://localhost:8083}
+          predicates:
+            - Path=/api/v1/ledger/**
+        - id: risk-service
+          uri: ${SERVICES_RISK_URL:http://localhost:8084}
+          predicates:
+            - Path=/api/v1/risk/**
+        - id: notification-service
+          uri: ${SERVICES_NOTIFICATION_URL:http://localhost:8085}
+          predicates:
+            - Path=/api/v1/notify/**
+  data:
+    redis:
+      host: ${SPRING_REDIS_HOST:localhost}
+      port: 6379
+
+gateway:
+  jwt:
+    secret: ${JWT_SECRET:payflow-default-secret-key-change-in-production-32chars!}
+    enabled: ${JWT_ENABLED:true}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

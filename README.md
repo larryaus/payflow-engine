@@ -83,7 +83,7 @@ Request:
   "callback_url": "https://merchant.com/webhook/payment"
 }
 
-Response 201:
+Response 201 Created:
 {
   "payment_id": "PAY_20260322_abcdef",
   "status": "PENDING",
@@ -121,7 +121,7 @@ Request:
   "reason": "商品退货"
 }
 
-Response 201:
+Response 201 Created:
 {
   "refund_id": "REF_20260322_xyz",
   "payment_id": "PAY_20260322_abcdef",
@@ -130,7 +130,44 @@ Response 201:
 }
 ```
 
-### 3.4 账户余额查询
+### 3.4 查询退款列表
+
+```
+GET /api/v1/payments/{payment_id}/refunds
+
+Response 200:
+[
+  {
+    "refund_id": "REF_20260322_xyz",
+    "payment_id": "PAY_20260322_abcdef",
+    "amount": 5000,
+    "reason": "商品退货",
+    "status": "COMPLETED",
+    "created_at": "2026-03-22T10:01:00Z",
+    "completed_at": "2026-03-22T10:01:30Z"
+  }
+]
+```
+
+### 3.5 账户列表
+
+```
+GET /api/v1/accounts
+
+Response 200:
+[
+  {
+    "account_id": "ACC_001",
+    "account_name": "测试账户1",
+    "available_balance": 500000,
+    "frozen_balance": 0,
+    "currency": "CNY",
+    "updated_at": "2026-03-22T10:00:00Z"
+  }
+]
+```
+
+### 3.6 账户余额查询
 
 ```
 GET /api/v1/accounts/{account_id}/balance
@@ -156,34 +193,46 @@ Client             Nginx(frontend)    PaymentSvc      RiskSvc       AccountSvc  
   │────────────────────>│                │               │              │               │              │              │
   │                     │  限流检查       │               │              │               │              │              │
   │                     │  (10r/s)       │               │              │               │              │              │
-  │                     │  proxy_pass   │               │              │               │              │              │
+  │                     │  proxy_pass    │               │              │               │              │              │
   │                     │───────────────>│               │              │               │              │              │
   │                     │                │  幂等性检查    │              │               │              │              │
   │                     │                │  (Redis SETNX)│              │               │              │              │
+  │                     │                │  持久化订单    │              │               │              │              │
+  │                     │                │  (CREATED)    │              │               │              │              │
   │                     │                │               │              │               │              │              │
-  │                     │                │  1.风控检查    │              │               │              │              │
+  │                     │                │  1.风控检查(sync)             │               │              │              │
   │                     │                │──────────────>│              │               │              │              │
-  │                     │                │  risk: PASS   │              │               │              │              │
+  │                     │                │  PASS→PENDING │              │               │              │              │
   │                     │                │<──────────────│              │               │              │              │
   │                     │                │               │              │               │              │              │
-  │                     │                │  2.冻结付款方金额             │               │              │              │
-  │                     │                │─────────────────────────────>│               │              │              │
-  │                     │                │  freeze: OK                  │               │              │              │
-  │                     │                │<─────────────────────────────│               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  3.发布事件 payment.created   │               │              │              │
+  │                     │                │  2.发布 payment.created       │               │              │              │
   │                     │                │────────────────────────────────────────────────────────────>│              │
-  │  202 Accepted       │                │               │              │               │              │              │
+  │  201 Created        │                │               │              │               │              │              │
   │<────────────────────│                │               │              │               │              │              │
   │                     │                │               │              │               │              │              │
-  │                     │ (async)        │               │              │               │              │              │
-  │                     │                │               │              │  4.复式记账    │<─────────────│              │
+  │                     │  (async via Kafka consumer)    │              │               │              │              │
+  │                     │                │  3.冻结金额    │              │               │              │              │
+  │                     │                │  (PROCESSING) │──────────────────────────────────────────> │              │
+  │                     │                │               │  freeze: OK  │               │              │              │
+  │                     │                │               │<─────────────│               │              │              │
   │                     │                │               │              │               │              │              │
-  │                     │                │               │  5.解冻+转账  │               │<─────────────│              │
+  │                     │                │               │  4.复式记账   │               │              │              │
+  │                     │                │──────────────────────────────────────────────────────────> │              │
+  │                     │                │               │  entry OK    │               │              │              │
+  │                     │                │               │<─────────────────────────────│              │              │
   │                     │                │               │              │               │              │              │
+  │                     │                │  5.转账        │              │               │              │              │
+  │                     │                │─────────────────────────────>│               │              │              │
+  │                     │                │  transfer OK (COMPLETED)      │               │              │              │
+  │                     │                │<─────────────────────────────│               │              │              │
+  │                     │                │               │              │               │              │              │
+  │                     │                │  6.发布 payment.completed     │               │              │              │
+  │                     │                │────────────────────────────────────────────────────────────>│              │
   │                     │                │               │              │               │              │─────────────>│
-  │                     │                │               │              │               │              │  6.Webhook   │──> callback
+  │                     │                │               │              │               │              │  7.Webhook   │──> callback
 ```
+
+**失败补偿（Saga）：** 若步骤 4/5 失败，按逆序补偿：reverseEntry → unfreezeAmount → 状态标记 FAILED → 发布 payment.failed。
 
 ### 4.1 支付状态机
 
@@ -193,15 +242,16 @@ Client             Nginx(frontend)    PaymentSvc      RiskSvc       AccountSvc  
                 └────┬─────┘
                      │ 风控通过
                      ▼
-                ┌──────────┐    风控拒绝    ┌──────────┐
-                │ PENDING  │───────────────>│ REJECTED │
-                └────┬─────┘               └──────────┘
-                     │ 冻结成功
+                ┌──────────┐    风控拒绝(sync)  ┌──────────┐
+                │ PENDING  │──────────────────>│ REJECTED │
+                └────┬─────┘                  └──────────┘
+      (CREATED也可→REJECTED)
+                     │ Kafka消费触发
                      ▼
                 ┌──────────────┐
                 │ PROCESSING   │
                 └────┬────┬────┘
-          转账成功   │    │ 转账失败
+          转账成功   │    │ 转账失败(+Saga补偿)
                      ▼    ▼
             ┌───────────┐ ┌──────────┐
             │ COMPLETED │ │  FAILED  │
@@ -209,7 +259,7 @@ Client             Nginx(frontend)    PaymentSvc      RiskSvc       AccountSvc  
                   │ 发起退款
                   ▼
             ┌───────────┐
-            │ REFUNDED  │ (全额/部分)
+            │ REFUNDED  │ (全额/部分, RefundStatus: PROCESSING→COMPLETED/FAILED)
             └───────────┘
 ```
 
@@ -300,12 +350,13 @@ limit_req_status 429;
 异步链路(后台处理): 分录记账 → 实际转账 → 解冻 → 通知
 
 Kafka Topic 设计:
-├── payment.created     (Partition by account_id, 保证同账户顺序)
-├── payment.completed
-├── payment.failed
-├── ledger.entry
-├── notification.send
-└── risk.alert
+├── payment.created     (Producer: payment-service; 按 from_account 分区，保证同账户顺序)
+├── payment.completed   (Producer: payment-service)
+├── payment.failed      (Producer: payment-service)
+└── notification.send   (Consumer: notification-service)
+
+注意: ledger.entry 和 risk.alert 在代码中并不存在。
+账务操作通过同步 REST 调用 ledger-service 完成，非 Kafka。
 ```
 
 ---
@@ -422,27 +473,47 @@ payflow-engine/
 │   └── src/main/java/com/payflow/payment/
 │       ├── PaymentApplication.java
 │       ├── controller/
-│       │   └── PaymentController.java          # REST API 入口
+│       │   └── PaymentController.java          # REST API 入口 (含 request record DTOs)
 │       ├── service/
-│       │   ├── PaymentService.java             # 支付编排(主流程)
-│       │   └── RefundService.java              # 退款逻辑
+│       │   ├── PaymentService.java             # 支付编排(主流程 + 异步处理 + Saga补偿)
+│       │   ├── RefundService.java              # 退款逻辑
+│       │   └── pipeline/
+│       │       ├── PaymentCreationPipeline.java # 流水线编排器
+│       │       ├── PaymentCreationContext.java  # 流水线上下文(含 shortCircuit)
+│       │       ├── PaymentCreationStep.java     # Step 接口
+│       │       └── step/
+│       │           ├── IdempotencyStep.java     # Step1: 幂等占位
+│       │           ├── OrderPersistStep.java    # Step2: 订单持久化
+│       │           ├── RiskCheckStep.java       # Step3: 风控检查
+│       │           └── EventPublishStep.java    # Step4: 事件发布
+│       ├── dto/
+│       │   ├── CreatePaymentResponse.java
+│       │   ├── PaymentResponse.java
+│       │   ├── PaymentListResponse.java
+│       │   ├── RefundResponse.java
+│       │   └── RefundDetailResponse.java
 │       ├── domain/
 │       │   ├── PaymentOrder.java               # 支付订单实体
-│       │   ├── PaymentStatus.java              # 状态枚举(含状态机)
+│       │   ├── PaymentStatus.java              # 状态枚举(含状态机 canTransitTo)
 │       │   ├── RefundOrder.java                # 退款实体
-│       │   └── RefundStatus.java               # 退款状态枚举
+│       │   └── RefundStatus.java               # 退款状态枚举(PROCESSING/COMPLETED/FAILED)
 │       ├── repository/
 │       │   ├── PaymentOrderRepository.java
 │       │   └── RefundOrderRepository.java
 │       ├── client/
 │       │   ├── AccountClient.java              # Feign → account-service
+│       │   ├── AccountClientFallbackFactory.java # 熔断降级
 │       │   ├── RiskClient.java                 # Feign → risk-service
-│       │   └── LedgerClient.java               # Feign → ledger-service
+│       │   ├── RiskClientFallbackFactory.java  # 熔断降级
+│       │   ├── LedgerClient.java               # Feign → ledger-service
+│       │   └── LedgerClientFallbackFactory.java # 熔断降级
 │       ├── mq/
 │       │   ├── PaymentEventProducer.java       # Kafka 生产者
-│       │   └── PaymentEventConsumer.java       # Kafka 消费者
+│       │   └── PaymentEventConsumer.java       # Kafka 消费者(触发 processPaymentAsync)
 │       ├── config/
-│       │   └── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
+│       │   ├── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
+│       │   ├── KafkaConfig.java                # Kafka 配置
+│       │   └── WebConfig.java                  # Web 配置
 │       └── exception/
 │           ├── PaymentException.java
 │           └── GlobalExceptionHandler.java
@@ -497,7 +568,8 @@ payflow-engine/
     ├── 001_create_payment_order.sql
     ├── 002_create_account.sql
     ├── 003_create_ledger_entry.sql
-    └── 004_create_refund_order.sql
+    ├── 004_create_refund_order.sql
+    └── 005_seed_accounts.sql       # 测试账户种子数据 (acc001-acc004)
 ```
 
 ---
@@ -694,7 +766,10 @@ curl -X POST http://localhost:8081/api/v1/payments \
 # 3. 查询支付状态
 curl http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX
 
-# 4. 查询账户余额
+# 4. 查询账户列表
+curl http://localhost:8082/api/v1/accounts
+
+# 5. 查询账户余额
 curl http://localhost:8082/api/v1/accounts/ACC_001/balance
 
 # 5. 发起退款
