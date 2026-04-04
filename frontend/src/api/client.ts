@@ -19,8 +19,11 @@ apiClient.interceptors.request.use((config) => {
 apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
-    const message = error.response?.data?.message || '请求失败，请稍后重试';
-    console.error('[API Error]', message);
+    if (error.response?.status === 401) {
+      localStorage.removeItem('auth_token');
+      window.location.href = '/login';
+      return Promise.reject(error);
+    }
     return Promise.reject(error);
   }
 );

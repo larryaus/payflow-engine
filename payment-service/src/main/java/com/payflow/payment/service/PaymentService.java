@@ -117,22 +117,27 @@ public class PaymentService {
     }
 
     private void compensate(PaymentOrder order, boolean froze, boolean ledgerCreated) {
+        boolean ledgerReversed = true;
         if (ledgerCreated) {
             try {
                 ledgerClient.reverseEntry(order.getPaymentId(),
                         order.getFromAccount(), order.getToAccount(), order.getAmount());
             } catch (Exception ex) {
+                ledgerReversed = false;
                 log.error("Payment {} compensation: ledger reversal failed — manual intervention required: {}",
                         order.getPaymentId(), ex.getMessage());
             }
         }
-        if (froze) {
+        if (froze && ledgerReversed) {
             try {
                 accountClient.unfreezeAmount(order.getFromAccount(), order.getAmount());
             } catch (Exception ex) {
                 log.error("Payment {} compensation: unfreeze failed — manual intervention required: {}",
                         order.getPaymentId(), ex.getMessage());
             }
+        } else if (froze) {
+            log.error("Payment {} compensation: skipping unfreeze because ledger reversal failed — manual intervention required",
+                    order.getPaymentId());
         }
     }
 

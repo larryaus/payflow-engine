@@ -8,6 +8,10 @@ import com.payflow.payment.dto.RefundDetailResponse;
 import com.payflow.payment.dto.RefundResponse;
 import com.payflow.payment.service.PaymentService;
 import com.payflow.payment.service.RefundService;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import org.springframework.data.domain.Page;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -33,7 +37,7 @@ public class PaymentController {
     @PostMapping
     public ResponseEntity<CreatePaymentResponse> createPayment(
             @RequestHeader("Idempotency-Key") String idempotencyKey,
-            @RequestBody CreatePaymentRequest request) {
+            @Valid @RequestBody CreatePaymentRequest request) {
 
         PaymentOrder order = paymentService.createPayment(idempotencyKey, request);
 
@@ -51,6 +55,9 @@ public class PaymentController {
     public ResponseEntity<PaymentListResponse> listPayments(
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int size) {
+
+        if (page < 1) page = 1;
+        if (size < 1 || size > 100) size = 20;
 
         Page<PaymentOrder> result = paymentService.listPayments(page, size);
         List<PaymentResponse> items = result.getContent().stream()
@@ -95,7 +102,7 @@ public class PaymentController {
     public ResponseEntity<RefundResponse> refund(
             @PathVariable String paymentId,
             @RequestHeader("Idempotency-Key") String idempotencyKey,
-            @RequestBody RefundRequest request) {
+            @Valid @RequestBody RefundRequest request) {
 
         var refund = refundService.createRefund(paymentId, idempotencyKey, request);
 
@@ -110,17 +117,17 @@ public class PaymentController {
     // --- Request DTOs ---
 
     public record CreatePaymentRequest(
-            String from_account,
-            String to_account,
-            Long amount,
-            String currency,
-            String payment_method,
+            @NotBlank String from_account,
+            @NotBlank String to_account,
+            @NotNull @Min(1) Long amount,
+            @NotBlank String currency,
+            @NotBlank String payment_method,
             String memo,
             String callback_url
     ) {}
 
     public record RefundRequest(
-            Long amount,
+            @NotNull @Min(1) Long amount,
             String reason
     ) {}
 

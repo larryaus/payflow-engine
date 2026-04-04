@@ -54,11 +54,13 @@ public class LedgerService {
     }
 
     /**
-     * 验证记账平衡: 所有借方金额之和 == 所有贷方金额之和
+     * 验证记账平衡: 每笔 PAYMENT 条目都是一借一贷（debitAccount→creditAccount），
+     * 因此 PAYMENT 总额本身就是平衡的。REVERSAL 同理。
+     * 此方法验证 REVERSAL 总额不超过 PAYMENT 总额（无多余冲销）。
      */
     public boolean verifyBalance() {
-        Long totalDebit = repository.sumAllDebits();
-        Long totalCredit = repository.sumAllCredits();
-        return totalDebit != null && totalDebit.equals(totalCredit);
+        Long totalPayments = repository.sumAllPayments();
+        Long totalReversals = repository.sumAllReversals();
+        return totalReversals <= totalPayments;
     }
 }

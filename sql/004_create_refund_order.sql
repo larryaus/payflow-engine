@@ -9,3 +9,5 @@ CREATE TABLE refund_order (
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ
 );
+
+CREATE INDEX idx_refund_payment ON refund_order(payment_id);

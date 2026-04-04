@@ -81,7 +81,11 @@ function PaymentCreatePage() {
           <Input.TextArea rows={3} placeholder="付款备注 (可选)" />
         </Form.Item>
 
-        <Form.Item name="callback_url" label="回调地址">
+        <Form.Item
+          name="callback_url"
+          label="回调地址"
+          rules={[{ type: 'url', message: '请输入有效的URL地址' }]}
+        >
           <Input placeholder="https://your-domain.com/webhook (可选)" />
         </Form.Item>
 

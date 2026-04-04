@@ -12,3 +12,5 @@ CREATE TABLE ledger_entry (
 );
 
 CREATE INDEX idx_ledger_payment ON ledger_entry(payment_id);
+CREATE INDEX idx_ledger_debit_account ON ledger_entry(debit_account, created_at);
+CREATE INDEX idx_ledger_credit_account ON ledger_entry(credit_account, created_at);

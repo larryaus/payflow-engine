@@ -13,6 +13,7 @@ function PaymentListPage() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [statusFilter, setStatusFilter] = useState<string>();
+  const [searchText, setSearchText] = useState('');
 
   const fetchData = async () => {
     setLoading(true);
@@ -101,7 +102,14 @@ function PaymentListPage() {
               { value: 'REFUNDED', label: '已退款' },
             ]}
           />
-          <Input placeholder="搜索支付单号" prefix={<SearchOutlined />} style={{ width: 250 }} />
+          <Input
+            placeholder="搜索支付单号"
+            prefix={<SearchOutlined />}
+            style={{ width: 250 }}
+            value={searchText}
+            onChange={(e) => setSearchText(e.target.value)}
+            allowClear
+          />
         </Space>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/payments/create')}>
           发起支付
@@ -109,7 +117,7 @@ function PaymentListPage() {
       </div>
       <Table
         columns={columns}
-        dataSource={data}
+        dataSource={searchText ? data.filter(d => d.payment_id.toLowerCase().includes(searchText.toLowerCase())) : data}
         rowKey="payment_id"
         loading={loading}
         pagination={{
