@@ -8,10 +8,11 @@ PayFlow Engine is a **polyglot microservices payment platform** simulating a fin
 
 ## Architecture
 
-Six services communicate via REST (sync) and Kafka (async):
+Seven services communicate via REST (sync) and Kafka (async):
 
 | Service | Language/Framework | Port | Role |
 |---|---|---|---|
+| `gateway-service` | Java 21 + Spring Cloud Gateway | 8080 | API gateway — routing, JWT auth, rate limiting, tracing |
 | `payment-service` | Java 21 + Spring Boot 3 | 8081 | Orchestrator — accepts payments, coordinates flow |
 | `account-service` | Java 21 + Spring Boot 3 | 8082 | Balance management — freeze/transfer/unfreeze |
 | `ledger-service` | Java 21 + Spring Boot 3 | 8083 | Double-entry accounting records |
@@ -21,13 +22,18 @@ Six services communicate via REST (sync) and Kafka (async):
 
 **Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6 — KRaft mode, no ZooKeeper), Nginx
 
-**Rate limiting:** Nginx (`frontend/nginx.conf`) — `limit_req_zone` 10r/s per IP, burst=20, applies to all `/api/*` routes, returns 429 on exceed.
+**Rate limiting:** Gateway service (`gateway-service`) — Redis token bucket via Spring Cloud Gateway `RequestRateLimiter` filter, 10r/s per IP, burst capacity 20, key resolved from `X-Forwarded-For` / `X-Real-IP` / remote address.
+
+**Authentication:** Gateway service validates JWT tokens on all routes except whitelisted paths (`/actuator/**`, health endpoints). Valid tokens produce `X-Auth-User` and `X-Auth-Roles` headers forwarded to downstream services. JWT can be disabled via `JWT_ENABLED=false`.
+
+**Tracing:** Gateway service generates `X-Trace-Id` header (UUID) on every request if not already present, forwarded to all downstream services and returned in responses.
 
 ### Payment Flow (Sync → Async)
 
 **Synchronous path (returns 201 Created):**
 ```
-Client → Payment Service
+Client → Nginx → Gateway Service (JWT auth, rate limit, trace ID)
+       → Payment Service
        → IdempotencyStep  (Redis SETNX, 24h TTL; short-circuit on duplicate)
        → OrderPersistStep (create PaymentOrder, status=CREATED)
        → RiskCheckStep    (sync Feign → Risk Service; PASS→PENDING, FAIL→REJECTED+exception)
@@ -58,6 +64,12 @@ On failure → Saga compensation (reverse order):
 
 ```
 payflow-engine/
+├── gateway-service/          # Java Spring Cloud Gateway — API gateway
+│   └── src/main/java/com/payflow/gateway/
+│       ├── config/           # JwtProperties, RateLimiterConfig (ipKeyResolver)
+│       └── filter/           # AuthenticationFilter (JWT), TraceIdFilter, RequestLoggingFilter
+│   └── src/main/resources/
+│       └── application.yml   # Route definitions, Redis rate limiter, JWT config
 ├── payment-service/          # Java Spring Boot — payment orchestration
 │   └── src/main/java/com/payflow/payment/
 │       ├── controller/       # REST endpoints + request record DTOs
@@ -97,7 +109,7 @@ payflow-engine/
 │   ├── consumer/             # kafka_consumer.go (StartKafkaConsumer)
 │   └── handler/              # webhook.go (WebhookHandler)
 ├── frontend/                 # React + TypeScript SPA + Nginx
-│   ├── nginx.conf            # Static hosting + reverse proxy + rate limiting
+│   ├── nginx.conf            # Static hosting + reverse proxy to gateway-service
 │   └── src/
 │       ├── App.tsx           # Route definitions
 │       ├── main.tsx          # Entry point
@@ -140,6 +152,12 @@ cd payment-service   # or account-service / ledger-service
 mvn spring-boot:run
 ```
 
+**Gateway service (Java — Spring Cloud Gateway):**
+```bash
+cd gateway-service
+mvn spring-boot:run   # Runs on port 8080, requires Redis for rate limiting
+```
+
 **Risk service (Python):**
 ```bash
 cd risk-service
@@ -157,7 +175,7 @@ go run main.go
 ```bash
 cd frontend
 npm install
-npm run dev   # Dev server on port 3000, proxies /api to localhost:8081
+npm run dev   # Dev server on port 3000, proxies /api to gateway on localhost:8080
 ```
 
 ### Building
@@ -238,10 +256,21 @@ Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting
 - **Webhook only:** Only `handler/webhook.go` exists — no SMS/email handlers
 - **HTTP endpoints:** `GET /health` (health check), `POST /api/v1/notify/webhook` (manual webhook retry trigger)
 
+### Gateway Service (Spring Cloud Gateway)
+
+- **Package structure:** `com.payflow.gateway` — config and filter packages
+- **Routing:** Defined in `application.yml` under `spring.cloud.gateway.routes` — each backend service has a route entry keyed by path prefix
+- **Rate limiting:** Uses Spring Cloud Gateway `RequestRateLimiter` filter with Redis token bucket — configured as a default filter applying to all routes. `RateLimiterConfig` provides an `ipKeyResolver` bean that resolves client IP from `X-Forwarded-For` → `X-Real-IP` → remote address
+- **Authentication:** `AuthenticationFilter` (order -2) validates JWT `Bearer` tokens using JJWT. Whitelisted paths skip auth. On valid token, `X-Auth-User` and `X-Auth-Roles` headers are injected for downstream services. Controlled by `gateway.jwt.enabled` property
+- **Tracing:** `TraceIdFilter` (order -3) generates/propagates `X-Trace-Id` header on every request
+- **Logging:** `RequestLoggingFilter` (order -1) logs method, path, status, duration, client IP, and trace ID for every request
+- **Adding new routes:** Add a new entry under `spring.cloud.gateway.routes` in `gateway-service/src/main/resources/application.yml` with id, uri, and path predicate
+- **Adding auth whitelist paths:** Add patterns to the `WHITELIST` list in `AuthenticationFilter.java`
+
 ### Nginx (Frontend)
 
-- **Config:** `frontend/nginx.conf` — handles static files and reverse proxy
-- **Rate limiting:** `limit_req_zone` on `/api/v1/payments` and `/api/v1/accounts` — 10r/s per IP, burst=20, returns 429
+- **Config:** `frontend/nginx.conf` — serves static files and proxies `/api/` requests to `gateway-service:8080`
+- **No rate limiting:** Rate limiting is handled by the gateway service, not Nginx
 
 ### Database
 
@@ -284,6 +313,18 @@ All Feign clients in payment-service have circuit breakers configured in `applic
 ---
 
 ## API Reference
+
+### Gateway Service (port 8080)
+All client requests should go through the gateway. It routes by path prefix:
+- `/api/v1/payments/**` → payment-service (8081)
+- `/api/v1/accounts/**` → account-service (8082)
+- `/api/v1/ledger/**` → ledger-service (8083)
+- `/api/v1/risk/**` → risk-service (8084)
+- `/api/v1/notify/**` → notification-service (8085)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/actuator/health` | Gateway health check |
 
 ### Payment Service (port 8081)
 | Method | Path | Description |
@@ -329,10 +370,10 @@ All Feign clients in payment-service have circuit breakers configured in `applic
 
 - **CI** (`.github/workflows/ci.yml`): Runs on push to `main`/`develop` and PRs to `main`. Parallel jobs per service:
   - Frontend: `npm ci` → `npm run lint` → `npm run build`
-  - Java services: `mvn -B clean verify`
+  - Java services (payment, account, ledger, gateway): `mvn -B clean verify`
   - Risk service: `pip install -r requirements.txt` → `python -m py_compile main.py`
   - Notification service: `go mod tidy` → `go build ./...`
-- **CD** (`.github/workflows/cd.yml`): Matrix build for all 6 services. On push to `main` → build & push Docker images to `ghcr.io` + deploy to staging. On version tags (`v*`) → deploy to production.
+- **CD** (`.github/workflows/cd.yml`): Matrix build for all 7 services. On push to `main` → build & push Docker images to `ghcr.io` + deploy to staging. On version tags (`v*`) → deploy to production.
 - **Pre-commit hook**: Runs `lint-staged` on frontend files (ESLint + Prettier). Defined in `.husky/pre-commit` and `.lintstagedrc.json`.
 
 ---
