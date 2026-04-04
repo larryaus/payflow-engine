@@ -11,19 +11,25 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    Frontend — Nginx (port 3000 / 80)                        │
 │   ┌──────────────────────┐  ┌────────────────────────────────────────┐      │
-│   │ 静态资源 (React SPA)  │  │ 反向代理 + 限流 (10r/s per IP, burst=20)│      │
+│   │ 静态资源 (React SPA)  │  │ 反向代理 → Gateway Service              │      │
 │   └──────────────────────┘  └────────────────────────────────────────┘      │
-└──────────┬──────────────────────────────┬───────────────────────────────────┘
-           │ /api/v1/payments             │ /api/v1/accounts
-           ▼                              ▼
-┌──────────────────┐          ┌──────────────────┐  ┌──────────────────────┐
-│  Payment Service │          │  Account Service │  │  Notification Service│
-│  (支付核心服务)   │          │  (账户服务)       │  │  (通知服务)           │
-│                  │          │                  │  │                      │
-│ - 支付下单       │          │ - 账户余额查询    │  │ - Webhook 回调       │
-│ - 支付状态查询   │          │ - 账户冻结/解冻   │  │                      │
-│ - 退款处理       │          │ - 转账           │  │                      │
-└────────┬─────────┘          └──────────────────┘  └──────────────────────┘
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │ /api/*
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               Gateway Service — Spring Cloud Gateway (port 8080)            │
+│   ┌────────────────┐ ┌──────────────┐ ┌────────────┐ ┌───────────────┐     │
+│   │ JWT 认证        │ │ Redis 限流    │ │ Trace ID   │ │ 请求日志       │     │
+│   │ (Bearer Token) │ │ (10r/s/IP)   │ │ (X-Trace-Id)│ │ (method/path) │     │
+│   └────────────────┘ └──────────────┘ └────────────┘ └───────────────┘     │
+└──────┬──────────┬──────────┬──────────┬──────────┬─────────────────────────┘
+       │          │          │          │          │
+       ▼          ▼          ▼          ▼          ▼
+┌────────────┐┌────────────┐┌────────────┐┌────────────┐┌──────────────────┐
+│  Payment   ││  Account   ││  Ledger    ││  Risk      ││  Notification    │
+│  Service   ││  Service   ││  Service   ││  Service   ││  Service         │
+│  (8081)    ││  (8082)    ││  (8083)    ││  (8084)    ││  (8085)          │
+└────────┬───┘└────────────┘└────────────┘└────────────┘└──────────────────┘
          │ (sync Feign)
          ├──────────────────> Risk Service (风控规则引擎)
          │                    - 黑名单检查 / 限额管理
@@ -32,18 +38,18 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         Message Queue (Kafka)                               │
 │  Topics: payment.created | payment.completed | payment.failed               │
-│          ledger.entry    | notification.send | risk.alert                   │
+│          notification.send                                                  │
 └──────────────────────────────┬──────────────────────────────────────────────┘
                                │
          ┌─────────────────────┼─────────────────────┐
          ▼                     ▼                      ▼
 ┌──────────────────┐  ┌──────────────┐  ┌──────────────────────┐
 │  PostgreSQL      │  │  Redis       │  │  Ledger Service      │
-│  (主数据库)       │  │  (缓存/锁)   │  │  (记账/分录服务)      │
-│                  │  │              │  │                      │
+│  (主数据库)       │  │  (缓存/锁/   │  │  (记账/分录服务)      │
+│                  │  │   限流)       │  │                      │
 │ - 支付订单表     │  │ - 幂等性控制  │  │ - 复式记账           │
 │ - 账户表         │  │ - 分布式锁   │  │ - 事务一致性         │
-│ - 分录表         │  │              │  │                      │
+│ - 分录表         │  │ - 网关限流   │  │                      │
 │ - 退款表         │  │              │  │                      │
 └──────────────────┘  └──────────────┘  └──────────────────────┘
 ```
@@ -54,7 +60,8 @@
 
 | 服务名 | 职责 | 技术栈 | 端口 |
 |--------|------|--------|------|
-| `frontend` | 前端 SPA + Nginx 反向代理（限流 10r/s per IP） | React + TypeScript + Ant Design + Nginx | 3000 |
+| `frontend` | 前端 SPA + Nginx 反向代理 | React + TypeScript + Ant Design + Nginx | 3000 |
+| `gateway-service` | API 网关（路由、JWT 认证、限流、链路追踪） | Java 21 + Spring Cloud Gateway | 8080 |
 | `payment-service` | 支付核心流程（下单、查询、退款） | Java 21 + Spring Boot 3 | 8081 |
 | `account-service` | 账户管理、余额查询、冻结解冻、转账 | Java 21 + Spring Boot 3 | 8082 |
 | `ledger-service` | 复式记账、分录管理 | Java 21 + Spring Boot 3 | 8083 |
@@ -187,14 +194,17 @@ Response 200:
 ## 4. Payment Flow (支付流程)
 
 ```
-Client             Nginx(frontend)    PaymentSvc      RiskSvc       AccountSvc      LedgerSvc       Kafka         NotifySvc
+Client             Nginx(frontend)    GatewaySvc      PaymentSvc      RiskSvc       AccountSvc      LedgerSvc       Kafka         NotifySvc
   │                     │                │               │              │               │              │              │
   │  POST /payments     │                │               │              │               │              │              │
   │────────────────────>│                │               │              │               │              │              │
-  │                     │  限流检查       │               │              │               │              │              │
-  │                     │  (10r/s)       │               │              │               │              │              │
   │                     │  proxy_pass    │               │              │               │              │              │
   │                     │───────────────>│               │              │               │              │              │
+  │                     │                │  JWT 认证      │              │               │              │              │
+  │                     │                │  限流 (10r/s)  │              │               │              │              │
+  │                     │                │  Trace ID 注入 │              │               │              │              │
+  │                     │                │  路由转发      │              │               │              │              │
+  │                     │                │──────────────>│               │              │               │              │
   │                     │                │  幂等性检查    │              │               │              │              │
   │                     │                │  (Redis SETNX)│              │               │              │              │
   │                     │                │  持久化订单    │              │               │              │              │
@@ -311,18 +321,24 @@ public PaymentResult processPayment(PaymentRequest req) {
 
 ### 5.3 限流策略
 
-```nginx
-# frontend/nginx.conf — Nginx 漏桶算法
-limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
-
-# 应用于 /api/v1/payments 和 /api/v1/accounts
-limit_req zone=api_limit burst=20 nodelay;
-limit_req_status 429;
+```yaml
+# gateway-service/src/main/resources/application.yml — Redis 令牌桶算法
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 10      # 每秒补充 10 个令牌
+            redis-rate-limiter.burstCapacity: 20      # 最大突发 20 个令牌
+            redis-rate-limiter.requestedTokens: 1     # 每次请求消耗 1 个令牌
+            key-resolver: "#{@ipKeyResolver}"         # 按客户端 IP 限流
 ```
 
-- **rate=10r/s**：每个客户端 IP 每秒最多 10 个请求
-- **burst=20**：允许瞬间突发 20 个请求，超出直接返回 429
-- **zone 10m**：共享内存 10MB，可追踪约 16 万个 IP
+- **replenishRate=10**：每个客户端 IP 每秒最多 10 个请求
+- **burstCapacity=20**：允许瞬间突发 20 个请求，超出返回 429
+- **ipKeyResolver**：从 `X-Forwarded-For` → `X-Real-IP` → remote address 解析客户端 IP
+- 基于 Redis 实现，支持分布式部署下的全局限流
 
 ### 5.4 数据库层优化
 
@@ -439,8 +455,23 @@ payflow-engine/
 ├── CLAUDE.md                       # AI 助手指南
 ├── docker-compose.yml              # 全栈本地编排
 │
+├── gateway-service/                # API 网关 (Java Spring Cloud Gateway)
+│   ├── pom.xml
+│   ├── Dockerfile
+│   └── src/main/java/com/payflow/gateway/
+│       ├── GatewayApplication.java
+│       ├── config/
+│       │   ├── JwtProperties.java              # JWT 配置属性 (secret, enabled)
+│       │   └── RateLimiterConfig.java           # IP 限流 KeyResolver
+│       └── filter/
+│           ├── AuthenticationFilter.java        # JWT 认证过滤器 (order -2)
+│           ├── TraceIdFilter.java               # 链路追踪 X-Trace-Id (order -3)
+│           └── RequestLoggingFilter.java        # 请求日志 (order -1)
+│   └── src/main/resources/
+│       └── application.yml                      # 路由、限流、JWT 配置
+│
 ├── frontend/                       # 前端 (React + TypeScript + Ant Design)
-│   ├── nginx.conf                  # 静态托管 + 反向代理 + IP 限流
+│   ├── nginx.conf                  # 静态托管 + 反向代理到 Gateway Service
 │   ├── Dockerfile
 │   ├── package.json
 │   ├── tsconfig.json
@@ -693,7 +724,16 @@ go run main.go
 
 验证: `curl http://localhost:8085/health`
 
-#### 终端 6 — 前端
+#### 终端 6 — API 网关 (Java)
+
+```bash
+cd gateway-service
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8080"
+```
+
+验证: `curl http://localhost:8080/actuator/health`
+
+#### 终端 7 — 前端
 
 ```bash
 cd frontend
@@ -731,6 +771,7 @@ docker-compose down -v
 │ 服务                              │ 端口   │ 地址                      │
 ├──────────────────────────────────┼────────┼──────────────────────────┤
 │ Frontend (Nginx + React SPA)     │ 3000   │ http://localhost:3000     │
+│ Gateway Service (API 网关)        │ 8080   │ http://localhost:8080     │
 │ Payment Service                  │ 8081   │ http://localhost:8081     │
 │ Account Service                  │ 8082   │ http://localhost:8082     │
 │ Ledger Service                   │ 8083   │ http://localhost:8083     │
@@ -750,9 +791,10 @@ docker-compose down -v
 curl http://localhost:8084/health        # Risk Service
 curl http://localhost:8085/health        # Notification Service
 
-# 2. 创建支付订单
-curl -X POST http://localhost:8081/api/v1/payments \
+# 2. 通过网关创建支付订单
+curl -X POST http://localhost:8080/api/v1/payments \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <jwt-token>" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{
     "from_account": "ACC_001",
@@ -764,22 +806,28 @@ curl -X POST http://localhost:8081/api/v1/payments \
   }'
 
 # 3. 查询支付状态
-curl http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX
+curl -H "Authorization: Bearer <jwt-token>" \
+  http://localhost:8080/api/v1/payments/PAY_XXXXXXXX_XXXXXX
 
 # 4. 查询账户列表
-curl http://localhost:8082/api/v1/accounts
+curl -H "Authorization: Bearer <jwt-token>" \
+  http://localhost:8080/api/v1/accounts
 
 # 5. 查询账户余额
-curl http://localhost:8082/api/v1/accounts/ACC_001/balance
+curl -H "Authorization: Bearer <jwt-token>" \
+  http://localhost:8080/api/v1/accounts/ACC_001/balance
 
-# 5. 发起退款
-curl -X POST http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX/refund \
+# 6. 发起退款
+curl -X POST http://localhost:8080/api/v1/payments/PAY_XXXXXXXX_XXXXXX/refund \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <jwt-token>" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{
     "amount": 5000,
     "reason": "测试退款"
   }'
+
+# 提示: 开发环境可设置 JWT_ENABLED=false 跳过认证
 ```
 
 ### 9.7 数据库连接
@@ -803,5 +851,5 @@ redis-cli -h localhost -p 6379
 | 端口被占用 | `lsof -i :PORT` 找到进程并 kill，或修改配置中的端口 |
 | Kafka 启动失败 | 确保 Docker 分配了足够内存 (建议 >= 4GB) |
 | Java 服务连不上 PG | 确认 PostgreSQL 已完全启动: `docker-compose logs postgres` |
-| 前端 API 请求 404 | 确认 vite proxy 指向正确的网关端口，或直连后端服务 |
+| 前端 API 请求 404 | 确认 vite proxy 指向 Gateway Service (8080)，或直连后端服务 |
 | Maven 下载慢 | 配置 `~/.m2/settings.xml` 使用阿里云镜像源 |
