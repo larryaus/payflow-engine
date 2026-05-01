@@ -32,7 +32,7 @@ function MainLayout() {
     {
       key: '/audit',
       icon: <AuditOutlined />,
-      label: '���计日志',
+      label: '审计日志',
     },
   ];
 
