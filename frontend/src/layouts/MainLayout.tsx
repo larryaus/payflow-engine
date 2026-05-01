@@ -3,6 +3,7 @@ import {
   TransactionOutlined,
   BankOutlined,
   DashboardOutlined,
+  AuditOutlined,
 } from '@ant-design/icons';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 
@@ -27,6 +28,11 @@ function MainLayout() {
       key: '/accounts',
       icon: <BankOutlined />,
       label: '账户管理',
+    },
+    {
+      key: '/audit',
+      icon: <AuditOutlined />,
+      label: '���计日志',
     },
   ];
 

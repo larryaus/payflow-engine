@@ -1,5 +1,6 @@
 package com.payflow.payment.service;
 
+import com.payflow.payment.audit.AuditService;
 import com.payflow.payment.client.AccountClient;
 import com.payflow.payment.client.LedgerClient;
 import com.payflow.payment.controller.PaymentController.CreatePaymentRequest;
@@ -34,6 +35,7 @@ public class PaymentService {
     private final LedgerClient ledgerClient;
     private final PaymentEventProducer eventProducer;
     private final RedissonClient redissonClient;
+    private final AuditService auditService;
 
     public PaymentService(
             PaymentOrderRepository paymentOrderRepository,
@@ -41,13 +43,15 @@ public class PaymentService {
             AccountClient accountClient,
             LedgerClient ledgerClient,
             PaymentEventProducer eventProducer,
-            RedissonClient redissonClient) {
+            RedissonClient redissonClient,
+            AuditService auditService) {
         this.paymentOrderRepository = paymentOrderRepository;
         this.paymentCreationPipeline = paymentCreationPipeline;
         this.accountClient = accountClient;
         this.ledgerClient = ledgerClient;
         this.eventProducer = eventProducer;
         this.redissonClient = redissonClient;
+        this.auditService = auditService;
     }
 
     /**
@@ -89,16 +93,23 @@ public class PaymentService {
 
             accountClient.freezeAmount(order.getFromAccount(), order.getAmount());
             froze = true;
+            auditService.log("FREEZE_AMOUNT", "PAYMENT", paymentId,
+                    "account=" + order.getFromAccount() + " amount=" + order.getAmount(), "SUCCESS", null);
 
             ledgerClient.createEntry(order.getPaymentId(),
                     order.getFromAccount(), order.getToAccount(), order.getAmount());
             ledgerCreated = true;
+            auditService.log("CREATE_LEDGER_ENTRY", "PAYMENT", paymentId,
+                    "debit=" + order.getFromAccount() + " credit=" + order.getToAccount(), "SUCCESS", null);
 
             accountClient.transfer(order.getFromAccount(), order.getToAccount(), order.getAmount());
+            auditService.log("TRANSFER", "PAYMENT", paymentId,
+                    "from=" + order.getFromAccount() + " to=" + order.getToAccount() + " amount=" + order.getAmount(), "SUCCESS", null);
 
             order.transitTo(PaymentStatus.COMPLETED);
             paymentOrderRepository.save(order);
             eventProducer.sendPaymentCompleted(order);
+            auditService.log("PAYMENT_COMPLETED", "PAYMENT", paymentId, null, "SUCCESS", null);
 
             log.info("Payment {} completed successfully", paymentId);
 
@@ -117,21 +128,27 @@ public class PaymentService {
     }
 
     private void compensate(PaymentOrder order, boolean froze, boolean ledgerCreated) {
+        auditService.log("COMPENSATION_START", "PAYMENT", order.getPaymentId(),
+                "froze=" + froze + " ledgerCreated=" + ledgerCreated, "INFO", null);
         if (ledgerCreated) {
             try {
                 ledgerClient.reverseEntry(order.getPaymentId(),
                         order.getFromAccount(), order.getToAccount(), order.getAmount());
+                auditService.log("REVERSE_LEDGER", "PAYMENT", order.getPaymentId(), null, "SUCCESS", null);
             } catch (Exception ex) {
                 log.error("Payment {} compensation: ledger reversal failed — manual intervention required: {}",
                         order.getPaymentId(), ex.getMessage());
+                auditService.log("REVERSE_LEDGER", "PAYMENT", order.getPaymentId(), ex.getMessage(), "FAILED", null);
             }
         }
         if (froze) {
             try {
                 accountClient.unfreezeAmount(order.getFromAccount(), order.getAmount());
+                auditService.log("UNFREEZE_AMOUNT", "PAYMENT", order.getPaymentId(), null, "SUCCESS", null);
             } catch (Exception ex) {
                 log.error("Payment {} compensation: unfreeze failed — manual intervention required: {}",
                         order.getPaymentId(), ex.getMessage());
+                auditService.log("UNFREEZE_AMOUNT", "PAYMENT", order.getPaymentId(), ex.getMessage(), "FAILED", null);
             }
         }
     }
@@ -153,5 +170,6 @@ public class PaymentService {
         order.setUpdatedAt(Instant.now());
         paymentOrderRepository.save(order);
         eventProducer.sendPaymentFailed(order, reason);
+        auditService.log("PAYMENT_FAILED", "PAYMENT", order.getPaymentId(), reason, "FAILED", null);
     }
 }

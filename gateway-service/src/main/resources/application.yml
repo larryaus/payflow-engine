@@ -18,6 +18,10 @@ spring:
           uri: ${SERVICES_PAYMENT_URL:http://localhost:8081}
           predicates:
             - Path=/api/v1/payments/**
+        - id: audit-service
+          uri: ${SERVICES_PAYMENT_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/audit/**
         - id: account-service
           uri: ${SERVICES_ACCOUNT_URL:http://localhost:8082}
           predicates:

@@ -71,18 +71,29 @@ func consumeTopic(ctx context.Context, topic string) {
 			continue
 		}
 
-		log.Printf("[%s] received message: partition=%d offset=%d key=%s",
-			topic, msg.Partition, msg.Offset, string(msg.Key))
+		traceId := extractTraceId(msg.Headers)
+		log.Printf("[%s] [traceId=%s] received message: partition=%d offset=%d key=%s",
+			topic, traceId, msg.Partition, msg.Offset, string(msg.Key))
 
-		handleMessage(topic, msg.Value)
+		handleMessage(topic, msg.Value, traceId)
 	}
 }
 
+// extractTraceId reads the X-Trace-Id header from Kafka message headers.
+func extractTraceId(headers []kafka.Header) string {
+	for _, h := range headers {
+		if h.Key == "X-Trace-Id" {
+			return string(h.Value)
+		}
+	}
+	return "-"
+}
+
 // handleMessage 根据 topic 分发处理逻辑
-func handleMessage(topic string, value []byte) {
+func handleMessage(topic string, value []byte, traceId string) {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(value, &payload); err != nil {
-		log.Printf("[%s] invalid JSON payload: %v", topic, err)
+		log.Printf("[%s] [traceId=%s] invalid JSON payload: %v", topic, traceId, err)
 		return
 	}
 
@@ -90,12 +101,13 @@ func handleMessage(topic string, value []byte) {
 	case "payment.completed", "payment.failed", "notification.send":
 		callbackURL, _ := payload["callback_url"].(string)
 		if callbackURL == "" {
-			log.Printf("[%s] no callback_url in payload, skipping", topic)
+			log.Printf("[%s] [traceId=%s] no callback_url in payload, skipping", topic, traceId)
 			return
 		}
+		log.Printf("[%s] [traceId=%s] sending webhook to %s", topic, traceId, callbackURL)
 		handler.SendWebhookWithRetry(callbackURL, payload)
 
 	default:
-		log.Printf("unhandled topic: %s", topic)
+		log.Printf("[traceId=%s] unhandled topic: %s", traceId, topic)
 	}
 }

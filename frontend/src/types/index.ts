@@ -53,3 +53,16 @@ export interface AccountBalance {
   currency: string;
   updated_at: string;
 }
+
+export interface AuditLogEntry {
+  id: number;
+  traceId: string;
+  serviceName: string;
+  action: string;
+  resourceType: string;
+  resourceId: string;
+  detail: string;
+  result: string;
+  clientIp: string;
+  createdAt: string;
+}
