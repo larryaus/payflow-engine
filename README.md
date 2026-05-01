@@ -19,7 +19,7 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │               Gateway Service — Spring Cloud Gateway (port 8080)            │
 │   ┌────────────────┐ ┌──────────────┐ ┌────────────┐ ┌───────────────┐     │
-│   │ JWT 认证        │ │ Redis 限流    │ │ Trace ID   │ │ 请求日志       │     │
+│   │ JWT 认证 (默认关) │ │ Redis 限流    │ │ Trace ID   │ │ 请求日志       │     │
 │   │ (Bearer Token) │ │ (10r/s/IP)   │ │ (X-Trace-Id)│ │ (method/path) │     │
 │   └────────────────┘ └──────────────┘ └────────────┘ └───────────────┘     │
 └──────┬──────────┬──────────┬──────────┬──────────┬─────────────────────────┘
@@ -29,7 +29,12 @@
 │  Payment   ││  Account   ││  Ledger    ││  Risk      ││  Notification    │
 │  Service   ││  Service   ││  Service   ││  Service   ││  Service         │
 │  (8081)    ││  (8082)    ││  (8083)    ││  (8084)    ││  (8085)          │
+│            ││            ││            ││            ││                  │
+│  Audit /   ││  Actuator  ││  Actuator  ││  Trace mw  ││  Trace from      │
+│  Actuator  ││  /Trace    ││  /Trace    ││  (FastAPI) ││  Kafka headers   │
 └────────┬───┘└────────────┘└────────────┘└────────────┘└──────────────────┘
+         │   X-Trace-Id 跨进程: HTTP header → MDC → Feign 拦截器 → Kafka header → Go/Python
+         │   所有日志附带 [traceId=...]; payment-service 异步写入 audit_log 表
          │ (sync Feign)
          ├──────────────────> Risk Service (风控规则引擎)
          │                    - 黑名单检查 / 限额管理
@@ -189,6 +194,38 @@ Response 200:
 }
 ```
 
+### 3.7 审计日志查询
+
+```
+GET /api/v1/audit/logs?page=1&size=20         # 分页查询全部
+GET /api/v1/audit/trace/{traceId}             # 按链路 ID 还原全链路操作
+GET /api/v1/audit/resource?resource_type=PAYMENT&resource_id=PAY_xxx  # 按资源查询
+
+Response 200 (示例):
+[
+  {
+    "id": 42,
+    "trace_id": "8f4c1e2a3b...",
+    "service_name": "payment-service",
+    "action": "FREEZE_AMOUNT",
+    "resource_type": "PAYMENT",
+    "resource_id": "PAY_20260501_xxx",
+    "detail": "account=acc001 amount=10000",
+    "result": "SUCCESS",
+    "created_at": "2026-05-01T10:00:01Z"
+  }
+]
+```
+
+### 3.8 监控端点 (所有 Java 服务)
+
+```
+GET /actuator/health      # 健康检查 (含详情)
+GET /actuator/info        # 服务信息
+GET /actuator/metrics     # 指标
+GET /actuator/env         # 环境变量
+```
+
 ---
 
 ## 4. Payment Flow (支付流程)
@@ -242,7 +279,11 @@ Client             Nginx(frontend)    GatewaySvc      PaymentSvc      RiskSvc   
   │                     │                │               │              │               │              │  7.Webhook   │──> callback
 ```
 
-**失败补偿（Saga）：** 若步骤 4/5 失败，按逆序补偿：reverseEntry → unfreezeAmount → 状态标记 FAILED → 发布 payment.failed。
+**失败补偿（Saga）：** 失败处理按"是否已转账"分两路：
+- **转账前失败**：按逆序补偿 `reverseEntry → unfreezeAmount`，状态标记 `FAILED` → 发布 `payment.failed`。
+- **转账后失败**（DB 保存或事件发布异常）：资金已变动，**严禁补偿**。审计 `RECONCILE_REQUIRED`，并尽力把订单修正为 `COMPLETED`；遗留情况由对账作业兜底。
+
+**Kafka 重投保护：** `processPaymentAsync` 进入时若发现 `status != PENDING`，直接跳过（防止 consumer 重启后重放同一 offset 导致重复扣款）。
 
 ### 4.1 支付状态机
 
@@ -373,7 +414,52 @@ Kafka Topic 设计:
 
 注意: ledger.entry 和 risk.alert 在代码中并不存在。
 账务操作通过同步 REST 调用 ledger-service 完成，非 Kafka。
+所有事件消息均带 X-Trace-Id 头，确保跨进程链路追踪不丢失。
 ```
+
+### 5.6 乐观锁 + 重试
+
+```java
+// AccountService: @Version 乐观锁 + 重试 (最多 3 次, 每次新事务)
+public void transfer(String from, String to, Long amount) {
+    retryOnOptimisticLock(() -> transactionTemplate.executeWithoutResult(status -> {
+        Account fromAcc = getAccount(from);
+        Account toAcc   = getAccount(to);
+        fromAcc.debit(amount);
+        toAcc.credit(amount);
+        accountRepository.save(fromAcc);
+        accountRepository.save(toAcc);
+    }));
+}
+```
+
+- `Account` 与 `PaymentOrder` 均带 `@Version` 列
+- 冲突时由 `GlobalExceptionHandler` 返回 **409 Conflict**
+- ⚠️ `@Version` 字段**不要赋初始值** (保持 null)；否则 Spring Data 会把新实体当作"已持久化"，`save()` 走 `merge()` 路径，在 id 仍为 null 时引发重复插入。DB 列已设 `DEFAULT 0`。
+
+### 5.7 Feign 4xx 错误透传
+
+```java
+// FallbackPolicy: 4xx 业务错误必须原样抛出, 不能伪装成 SERVICE_UNAVAILABLE
+static void rethrowIfClientError(Throwable cause) {
+    if (cause instanceof FeignException fe && fe.status() >= 400 && fe.status() < 500) {
+        throw fe;
+    }
+}
+```
+
+`AccountClientFallbackFactory` / `LedgerClientFallbackFactory` 在降级前先调用 `FallbackPolicy.rethrowIfClientError()`：4xx 表示上游可达且返回了业务错误，应直接透传；只有 5xx / 网络错 / 熔断打开才走 `SERVICE_UNAVAILABLE` 降级。`RiskClientFallbackFactory` 故意不做此处理（风控不可用时拒绝是安全策略）。
+
+### 5.8 分布式链路追踪
+
+| 组件 | 实现 |
+|------|------|
+| Gateway | `TraceIdFilter` 生成 UUID（若入站无 `X-Trace-Id`）|
+| Java 服务 | `TraceFilter` (servlet, `HIGHEST_PRECEDENCE`) 写入 SLF4J MDC，`logback-spring.xml` 渲染 `[traceId=...]` |
+| Java Feign 出站 | `FeignTraceInterceptor` 自动从 MDC 复制到 header |
+| Kafka | `PaymentEventProducer` 写入 message header；`PaymentEventConsumer` / Go consumer / Python middleware 读回 |
+| Python (risk) | FastAPI `trace_middleware` 透传并附加到日志 |
+| Go (notification) | `extractTraceId(headers)` 从 Kafka header 解析 |
 
 ---
 
@@ -395,6 +481,7 @@ CREATE TABLE payment_order (
     payment_method  VARCHAR(32)  NOT NULL,
     memo            VARCHAR(256),
     callback_url    VARCHAR(512),
+    version         BIGINT       NOT NULL DEFAULT 0,    -- 乐观锁 (006_add_payment_order_version.sql)
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ
@@ -442,6 +529,24 @@ CREATE TABLE refund_order (
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ
 );
+
+-- 审计日志表 (006_create_audit_log.sql)
+CREATE TABLE audit_log (
+    id              BIGSERIAL PRIMARY KEY,
+    trace_id        VARCHAR(64),                          -- 链路 ID
+    service_name    VARCHAR(50)  NOT NULL,
+    action          VARCHAR(100) NOT NULL,                -- e.g. FREEZE_AMOUNT / TRANSFER / RECONCILE_REQUIRED
+    resource_type   VARCHAR(50)  NOT NULL,                -- PAYMENT / REFUND / ACCOUNT
+    resource_id     VARCHAR(100),
+    detail          TEXT,
+    result          VARCHAR(20)  NOT NULL DEFAULT 'SUCCESS',  -- SUCCESS / FAILED / INFO
+    client_ip       VARCHAR(45),
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_audit_log_trace_id  ON audit_log(trace_id);
+CREATE INDEX idx_audit_log_resource  ON audit_log(resource_type, resource_id);
+CREATE INDEX idx_audit_log_action    ON audit_log(action);
+CREATE INDEX idx_audit_log_created_at ON audit_log(created_at);
 ```
 
 ---
@@ -486,11 +591,13 @@ payflow-engine/
 │       │   ├── PaymentListPage.tsx             # 支付列表(分页/筛选)
 │       │   ├── PaymentCreatePage.tsx           # 发起支付表单
 │       │   ├── PaymentDetailPage.tsx           # 支付详情 + 退款
-│       │   └── AccountPage.tsx                 # 账户余额查询
+│       │   ├── AccountPage.tsx                 # 账户余额查询
+│       │   └── AuditPage.tsx                   # 审计日志列表 + Trace 时间线
 │       ├── api/
 │       │   ├── client.ts                       # Axios 实例(拦截器)
 │       │   ├── payment.ts                      # 支付 API 封装
-│       │   └── account.ts                      # 账户 API 封装
+│       │   ├── account.ts                      # 账户 API 封装
+│       │   └── audit.ts                        # 审计 API 封装
 │       ├── types/
 │       │   └── index.ts                        # TypeScript 类型定义
 │       ├── utils/
@@ -533,21 +640,32 @@ payflow-engine/
 │       │   └── RefundOrderRepository.java
 │       ├── client/
 │       │   ├── AccountClient.java              # Feign → account-service
-│       │   ├── AccountClientFallbackFactory.java # 熔断降级
+│       │   ├── AccountClientFallbackFactory.java # 熔断降级 (4xx 透传)
 │       │   ├── RiskClient.java                 # Feign → risk-service
-│       │   ├── RiskClientFallbackFactory.java  # 熔断降级
+│       │   ├── RiskClientFallbackFactory.java  # 熔断降级 (任何错误均拒绝, 安全策略)
 │       │   ├── LedgerClient.java               # Feign → ledger-service
-│       │   └── LedgerClientFallbackFactory.java # 熔断降级
+│       │   ├── LedgerClientFallbackFactory.java # 熔断降级 (4xx 透传)
+│       │   └── FallbackPolicy.java             # rethrowIfClientError(4xx 不伪装为 SERVICE_UNAVAILABLE)
+│       ├── audit/                              # 审计模块
+│       │   ├── AuditLog.java                   # 审计实体
+│       │   ├── AuditLogRepository.java
+│       │   ├── AuditService.java               # @Async 异步写入, 自动捕获 traceId
+│       │   └── AuditController.java            # /api/v1/audit/{logs|trace|resource}
 │       ├── mq/
-│       │   ├── PaymentEventProducer.java       # Kafka 生产者
-│       │   └── PaymentEventConsumer.java       # Kafka 消费者(触发 processPaymentAsync)
+│       │   ├── PaymentEventProducer.java       # Kafka 生产者(写入 X-Trace-Id 头)
+│       │   └── PaymentEventConsumer.java       # Kafka 消费者(读取 X-Trace-Id, 触发 processPaymentAsync)
 │       ├── config/
 │       │   ├── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
 │       │   ├── KafkaConfig.java                # Kafka 配置
-│       │   └── WebConfig.java                  # Web 配置
+│       │   ├── WebConfig.java                  # Web 配置
+│       │   ├── TraceFilter.java                # 入站 X-Trace-Id → MDC
+│       │   └── FeignTraceInterceptor.java      # 出站 Feign 自动注入 traceId
 │       └── exception/
 │           ├── PaymentException.java
-│           └── GlobalExceptionHandler.java
+│           └── GlobalExceptionHandler.java     # 含 OptimisticLockException → 409
+│   └── src/main/resources/
+│       ├── application.yml                    # Resilience4j + Actuator
+│       └── logback-spring.xml                 # [traceId=...] 日志格式
 │
 ├── account-service/                # 账户服务 (Java Spring Boot)
 │   ├── pom.xml
@@ -557,11 +675,18 @@ payflow-engine/
 │       ├── controller/
 │       │   └── AccountController.java          # freeze / unfreeze / transfer / balance
 │       ├── service/
-│       │   └── AccountService.java             # 余额操作、冻结解冻、分布式锁
+│       │   └── AccountService.java             # TransactionTemplate + 乐观锁重试 (3 次)
 │       ├── domain/
 │       │   └── Account.java                    # @Version 乐观锁
-│       └── repository/
-│           └── AccountRepository.java
+│       ├── config/
+│       │   └── TraceFilter.java                # 入站 X-Trace-Id → MDC
+│       ├── repository/
+│       │   └── AccountRepository.java
+│       └── exception/
+│           └── GlobalExceptionHandler.java     # OptimisticLockException → 409
+│   └── src/main/resources/
+│       ├── application.yml
+│       └── logback-spring.xml
 │
 ├── ledger-service/                 # 记账服务 (Java Spring Boot)
 │   ├── pom.xml
@@ -574,13 +699,18 @@ payflow-engine/
 │       │   └── LedgerService.java              # 复式记账逻辑
 │       ├── domain/
 │       │   └── LedgerEntry.java
+│       ├── config/
+│       │   └── TraceFilter.java                # 入站 X-Trace-Id → MDC
 │       └── repository/
 │           └── LedgerEntryRepository.java
+│   └── src/main/resources/
+│       ├── application.yml
+│       └── logback-spring.xml
 │
 ├── risk-service/                   # 风控服务 (Python FastAPI)
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── main.py                                 # FastAPI 入口
+│   ├── main.py                                 # FastAPI 入口 + trace_middleware
 │   └── rules/
 │       ├── rule_engine.py                      # 责任链编排
 │       ├── blacklist.py                        # 黑名单检查
@@ -593,14 +723,16 @@ payflow-engine/
 │   ├── handler/
 │   │   └── webhook.go                          # Webhook 回调
 │   └── consumer/
-│       └── kafka_consumer.go                   # 消费 Kafka 事件
+│       └── kafka_consumer.go                   # 消费 Kafka 事件 (extractTraceId)
 │
-└── sql/                            # 数据库初始化脚本(容器启动时自动执行)
+└── sql/                            # 数据库初始化脚本(容器启动时按字典序执行)
     ├── 001_create_payment_order.sql
     ├── 002_create_account.sql
     ├── 003_create_ledger_entry.sql
     ├── 004_create_refund_order.sql
-    └── 005_seed_accounts.sql       # 测试账户种子数据 (acc001-acc004)
+    ├── 005_seed_accounts.sql       # 测试账户种子数据 (acc001-acc004)
+    ├── 006_add_payment_order_version.sql  # PaymentOrder.version 列 (乐观锁)
+    └── 006_create_audit_log.sql           # 审计日志表
 ```
 
 ---
@@ -791,10 +923,9 @@ docker-compose down -v
 curl http://localhost:8084/health        # Risk Service
 curl http://localhost:8085/health        # Notification Service
 
-# 2. 通过网关创建支付订单
+# 2. 通过网关创建支付订单 (默认 JWT_ENABLED=false, 无需 Authorization)
 curl -X POST http://localhost:8080/api/v1/payments \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <jwt-token>" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{
     "from_account": "ACC_001",
@@ -806,28 +937,28 @@ curl -X POST http://localhost:8080/api/v1/payments \
   }'
 
 # 3. 查询支付状态
-curl -H "Authorization: Bearer <jwt-token>" \
-  http://localhost:8080/api/v1/payments/PAY_XXXXXXXX_XXXXXX
+curl http://localhost:8080/api/v1/payments/PAY_XXXXXXXX_XXXXXX
 
 # 4. 查询账户列表
-curl -H "Authorization: Bearer <jwt-token>" \
-  http://localhost:8080/api/v1/accounts
+curl http://localhost:8080/api/v1/accounts
 
 # 5. 查询账户余额
-curl -H "Authorization: Bearer <jwt-token>" \
-  http://localhost:8080/api/v1/accounts/ACC_001/balance
+curl http://localhost:8080/api/v1/accounts/ACC_001/balance
 
 # 6. 发起退款
 curl -X POST http://localhost:8080/api/v1/payments/PAY_XXXXXXXX_XXXXXX/refund \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <jwt-token>" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{
     "amount": 5000,
     "reason": "测试退款"
   }'
 
-# 提示: 开发环境可设置 JWT_ENABLED=false 跳过认证
+# 7. 按 trace ID 查全链路审计
+TRACE_ID=$(curl -sI http://localhost:8080/api/v1/accounts | awk '/X-Trace-Id/ {print $2}' | tr -d '\r')
+curl http://localhost:8080/api/v1/audit/trace/$TRACE_ID
+
+# 提示: 网关启用 JWT 时设置 JWT_ENABLED=true, 并在请求中加 Authorization: Bearer <token>
 ```
 
 ### 9.7 数据库连接
