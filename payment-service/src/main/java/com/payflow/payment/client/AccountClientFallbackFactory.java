@@ -16,6 +16,7 @@ public class AccountClientFallbackFactory implements FallbackFactory<AccountClie
         return new AccountClient() {
             @Override
             public void freezeAmount(String accountId, Long amount) {
+                FallbackPolicy.rethrowIfClientError(cause);
                 log.error("Account service unavailable on freezeAmount. account={} amount={}: {}",
                         accountId, amount, cause.getMessage());
                 throw new PaymentException("SERVICE_UNAVAILABLE", "账户服务不可用，无法冻结资金");
@@ -23,6 +24,7 @@ public class AccountClientFallbackFactory implements FallbackFactory<AccountClie
 
             @Override
             public void unfreezeAmount(String accountId, Long amount) {
+                FallbackPolicy.rethrowIfClientError(cause);
                 log.error("Account service unavailable on unfreezeAmount. account={} amount={}: {}",
                         accountId, amount, cause.getMessage());
                 throw new PaymentException("SERVICE_UNAVAILABLE", "账户服务不可用，无法解冻资金");
@@ -30,6 +32,7 @@ public class AccountClientFallbackFactory implements FallbackFactory<AccountClie
 
             @Override
             public void transfer(String fromAccount, String toAccount, Long amount) {
+                FallbackPolicy.rethrowIfClientError(cause);
                 log.error("Account service unavailable on transfer. from={} to={} amount={}: {}",
                         fromAccount, toAccount, amount, cause.getMessage());
                 throw new PaymentException("SERVICE_UNAVAILABLE", "账户服务不可用，无法完成转账");
