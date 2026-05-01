@@ -47,7 +47,7 @@ function AuditPage() {
       setTraceData(result);
       setTraceModalOpen(true);
     } catch {
-      message.error('加载链路追��失败');
+      message.error('加载链路追踪失败');
     }
   };
 
@@ -91,7 +91,7 @@ function AuditPage() {
       ellipsis: true,
     },
     {
-      title: '��情',
+      title: '详情',
       dataIndex: 'detail',
       key: 'detail',
       ellipsis: true,
