@@ -77,11 +77,19 @@ public class PaymentService {
      */
     public void processPaymentAsync(String paymentId) {
         PaymentOrder order = getPayment(paymentId);
+
+        if (order.getStatus() != PaymentStatus.PENDING) {
+            log.info("Payment {} already in status {}, skipping async processing (duplicate delivery)",
+                    paymentId, order.getStatus());
+            return;
+        }
+
         String lockKey = "account:lock:" + order.getFromAccount();
         RLock lock = redissonClient.getLock(lockKey);
 
         boolean froze = false;
         boolean ledgerCreated = false;
+        boolean transferred = false;
 
         try {
             if (!lock.tryLock(5, 30, TimeUnit.SECONDS)) {
@@ -103,6 +111,7 @@ public class PaymentService {
                     "debit=" + order.getFromAccount() + " credit=" + order.getToAccount(), "SUCCESS", null);
 
             accountClient.transfer(order.getFromAccount(), order.getToAccount(), order.getAmount());
+            transferred = true;
             auditService.log("TRANSFER", "PAYMENT", paymentId,
                     "from=" + order.getFromAccount() + " to=" + order.getToAccount() + " amount=" + order.getAmount(), "SUCCESS", null);
 
@@ -115,15 +124,60 @@ public class PaymentService {
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            compensate(order, froze, ledgerCreated);
-            handlePaymentFailure(order, "Lock interrupted");
+            handleAsyncFailure(order, froze, ledgerCreated, transferred, "Lock interrupted");
         } catch (Exception e) {
-            compensate(order, froze, ledgerCreated);
-            handlePaymentFailure(order, e.getMessage());
+            handleAsyncFailure(order, froze, ledgerCreated, transferred, e.getMessage());
         } finally {
             if (lock.isHeldByCurrentThread()) {
                 lock.unlock();
             }
+        }
+    }
+
+    /**
+     * 失败处理 — 区分两种情况:
+     * 1. 转账已成功但收尾失败 (DB save / event publish): 资金已变动,绝不能补偿,
+     *    标记为需人工对账;尽力把状态修正为 COMPLETED.
+     * 2. 转账前失败: 走 Saga 补偿,把订单标记为 FAILED.
+     */
+    private void handleAsyncFailure(PaymentOrder order, boolean froze, boolean ledgerCreated,
+                                    boolean transferred, String reason) {
+        if (transferred) {
+            log.error("Payment {} post-transfer state update failed — manual reconciliation required: {}",
+                    order.getPaymentId(), reason);
+            auditService.log("RECONCILE_REQUIRED", "PAYMENT", order.getPaymentId(),
+                    "transfer succeeded but state save failed: " + reason, "FAILED", null);
+            tryFinalizeCompleted(order);
+            return;
+        }
+        compensate(order, froze, ledgerCreated);
+        handlePaymentFailure(order, reason);
+    }
+
+    /**
+     * 转账已成功的订单, 尝试把状态改成 COMPLETED.
+     * 失败也只是记录日志 — 由对账作业兜底, 不能再触发补偿.
+     */
+    private void tryFinalizeCompleted(PaymentOrder order) {
+        try {
+            PaymentOrder fresh = paymentOrderRepository.findByPaymentId(order.getPaymentId())
+                    .orElseThrow(() -> new PaymentException("NOT_FOUND",
+                            "Payment not found: " + order.getPaymentId()));
+            if (fresh.getStatus() == PaymentStatus.COMPLETED) {
+                return;
+            }
+            if (fresh.getStatus().canTransitTo(PaymentStatus.COMPLETED)) {
+                fresh.transitTo(PaymentStatus.COMPLETED);
+                paymentOrderRepository.save(fresh);
+                eventProducer.sendPaymentCompleted(fresh);
+                auditService.log("PAYMENT_COMPLETED", "PAYMENT", fresh.getPaymentId(),
+                        "finalized after post-transfer recovery", "SUCCESS", null);
+            } else {
+                log.error("Payment {} stuck in {} after successful transfer — manual intervention required",
+                        fresh.getPaymentId(), fresh.getStatus());
+            }
+        } catch (Exception ex) {
+            log.error("Payment {} finalize attempt failed: {}", order.getPaymentId(), ex.getMessage());
         }
     }
 
