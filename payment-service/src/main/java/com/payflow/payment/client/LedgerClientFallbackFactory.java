@@ -16,6 +16,7 @@ public class LedgerClientFallbackFactory implements FallbackFactory<LedgerClient
         return new LedgerClient() {
             @Override
             public void createEntry(String referenceId, String debitAccount, String creditAccount, Long amount) {
+                FallbackPolicy.rethrowIfClientError(cause);
                 log.error("Ledger service unavailable on createEntry. ref={} debit={} credit={} amount={}: {}",
                         referenceId, debitAccount, creditAccount, amount, cause.getMessage());
                 throw new PaymentException("SERVICE_UNAVAILABLE", "记账服务不可用，无法创建账务分录");
@@ -23,6 +24,7 @@ public class LedgerClientFallbackFactory implements FallbackFactory<LedgerClient
 
             @Override
             public void reverseEntry(String referenceId, String debitAccount, String creditAccount, Long amount) {
+                FallbackPolicy.rethrowIfClientError(cause);
                 log.error("Ledger service unavailable on reverseEntry. ref={} debit={} credit={} amount={}: {}",
                         referenceId, debitAccount, creditAccount, amount, cause.getMessage());
                 throw new PaymentException("SERVICE_UNAVAILABLE", "记账服务不可用，无法撤销账务分录");
