@@ -48,7 +48,7 @@ public class PaymentOrder {
     private Instant updatedAt = Instant.now();
 
     @Version
-    private Long version = 0L;
+    private Long version;
 
     @Column(name = "completed_at")
     private Instant completedAt;

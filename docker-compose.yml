@@ -103,7 +103,7 @@ services:
       SERVER_PORT: "8080"
       SPRING_REDIS_HOST: redis
       JWT_SECRET: payflow-default-secret-key-change-in-production-32chars!
-      JWT_ENABLED: "true"
+      JWT_ENABLED: "false"
       SERVICES_PAYMENT_URL: http://payment-service:8081
       SERVICES_ACCOUNT_URL: http://account-service:8082
       SERVICES_LEDGER_URL: http://ledger-service:8083
