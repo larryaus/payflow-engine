@@ -46,7 +46,7 @@ spring:
 gateway:
   jwt:
     secret: ${JWT_SECRET:payflow-default-secret-key-change-in-production-32chars!}
-    enabled: ${JWT_ENABLED:true}
+    enabled: ${JWT_ENABLED:false}
 
 management:
   endpoints:
