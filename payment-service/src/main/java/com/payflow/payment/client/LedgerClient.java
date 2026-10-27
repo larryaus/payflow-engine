@@ -16,8 +16,5 @@ public interface LedgerClient {
 
     @PostMapping("/api/v1/ledger/entries/reverse")
     void reverseEntry(
-            @RequestParam("reference_id") String referenceId,
-            @RequestParam("debit_account") String debitAccount,
-            @RequestParam("credit_account") String creditAccount,
-            @RequestParam("amount") Long amount);
+            @RequestParam("payment_id") String paymentId);
 }

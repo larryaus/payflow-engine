@@ -37,6 +37,14 @@ public class AccountClientFallbackFactory implements FallbackFactory<AccountClie
                         fromAccount, toAccount, amount, cause.getMessage());
                 throw new PaymentException("SERVICE_UNAVAILABLE", "账户服务不可用，无法完成转账");
             }
+
+            @Override
+            public void reverseTransfer(String fromAccount, String toAccount, Long amount) {
+                FallbackPolicy.rethrowIfClientError(cause);
+                log.error("Account service unavailable on reverseTransfer. from={} to={} amount={}: {}",
+                        fromAccount, toAccount, amount, cause.getMessage());
+                throw new PaymentException("SERVICE_UNAVAILABLE", "账户服务不可用，无法逆向转账");
+            }
         };
     }
 }

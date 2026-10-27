@@ -35,15 +35,25 @@ public class LedgerService {
         return repository.save(entry);
     }
 
+    /**
+     * 记账冲销补偿: 创建借贷互换的 REVERSAL 分录，使双边账目归零
+     * 账本记录不可删除，冲销是唯一正确的会计补偿方式
+     */
     @Transactional
-    public LedgerEntry reverseEntry(String originalReferenceId, String debitAccount,
-                                     String creditAccount, Long amount) {
+    public LedgerEntry reverseEntry(String paymentId) {
+        List<LedgerEntry> entries = repository.findByPaymentId(paymentId);
+        LedgerEntry original = entries.stream()
+                .filter(e -> "PAYMENT".equals(e.getEntryType()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No PAYMENT ledger entry found for paymentId: " + paymentId));
+
         LedgerEntry reversal = new LedgerEntry();
-        reversal.setEntryId("LED_REV_" + UUID.randomUUID().toString().substring(0, 12));
-        reversal.setPaymentId("REVERSAL_" + originalReferenceId);
-        reversal.setDebitAccount(creditAccount);
-        reversal.setCreditAccount(debitAccount);
-        reversal.setAmount(amount);
+        reversal.setEntryId("LED_" + UUID.randomUUID().toString().substring(0, 12));
+        reversal.setPaymentId(paymentId);
+        reversal.setDebitAccount(original.getCreditAccount());   // 借贷互换
+        reversal.setCreditAccount(original.getDebitAccount());   // 借贷互换
+        reversal.setAmount(original.getAmount());
         reversal.setEntryType("REVERSAL");
         reversal.setStatus("COMPLETED");
         return repository.save(reversal);

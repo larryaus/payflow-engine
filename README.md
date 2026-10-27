@@ -41,22 +41,30 @@
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Message Queue (Kafka)                               │
-│  Topics: payment.created | payment.completed | payment.failed               │
-│          notification.send                                                  │
+│                         Temporal Server (port 7233)                         │
+│  Workflow: PaymentWorkflow  |  Task Queue: payment-workflow-queue           │
+│  Activities: freeze → ledger → transfer → complete / Saga compensation      │
 └──────────────────────────────┬──────────────────────────────────────────────┘
-                               │
+                               │ workflow activities (sync Feign)
          ┌─────────────────────┼─────────────────────┐
          ▼                     ▼                      ▼
 ┌────────────────────┐  ┌────────────────────┐  ┌──────────────────────────────┐
-│  PostgreSQL        │  │  Redis             │  │  Ledger Service              │
-│  (primary DB)      │  │  (cache / locks /  │  │  (bookkeeping / entries)     │
-│                    │  │   rate limiting)   │  │                              │
-│ - Payment orders   │  │ - Idempotency      │  │ - Double-entry bookkeeping   │
-│ - Accounts         │  │ - Distributed lock │  │ - Transactional consistency  │
-│ - Ledger entries   │  │ - Gateway limiter  │  │                              │
-│ - Refunds          │  │                    │  │                              │
+│  Account Service   │  │  Ledger Service    │  │  Kafka (notifications)       │
+│  freeze / transfer │  │  double-entry      │  │  payment.completed           │
+│  + reverse         │  │  + reversal        │  │  payment.failed              │
+│                    │  │                    │  │  notification.send           │
 └────────────────────┘  └────────────────────┘  └──────────────────────────────┘
+
+┌────────────────────┐  ┌────────────────────┐
+│  PostgreSQL        │  │  Redis             │
+│  (primary DB)      │  │  (cache / locks /  │
+│                    │  │   rate limiting)   │
+│ - Payment orders   │  │ - Idempotency      │
+│ - Accounts         │  │ - Distributed lock │
+│ - Ledger entries   │  │ - Gateway limiter  │
+│ - Refunds          │  │                    │
+│ - Audit log        │  │                    │
+└────────────────────┘  └────────────────────┘
 ```
 
 ---
@@ -72,6 +80,8 @@
 | `ledger-service` | Double-entry bookkeeping, ledger entry management | Java 21 + Spring Boot 3 | 8083 |
 | `risk-service` | Risk rule engine, blacklist, amount limits | Python 3.12 + FastAPI | 8084 |
 | `notification-service` | Webhook callback notifications | Go 1.22 | 8085 |
+| `temporal` | Workflow orchestration engine (payment Saga) | Temporal 1.24 | 7233 |
+| `temporal-ui` | Temporal web console | Temporal UI 2.26 | 8088 |
 
 ---
 
@@ -230,60 +240,65 @@ GET /actuator/env         # Environment variables
 
 ## 4. Payment Flow
 
+Fulfillment is orchestrated by a **Temporal workflow** (replacing the earlier Kafka choreography). The synchronous request ends once risk passes and the workflow is started; Temporal then drives every downstream step as an activity.
+
 ```
-Client             Nginx(frontend)    GatewaySvc      PaymentSvc      RiskSvc       AccountSvc      LedgerSvc       Kafka         NotifySvc
-  │                     │                │               │              │               │              │              │
-  │  POST /payments     │                │               │              │               │              │              │
-  │────────────────────>│                │               │              │               │              │              │
-  │                     │  proxy_pass    │               │              │               │              │              │
-  │                     │───────────────>│               │              │               │              │              │
-  │                     │                │  JWT auth     │              │               │              │              │
-  │                     │                │  Limit 10r/s  │              │               │              │              │
-  │                     │                │  Add Trace ID │              │               │              │              │
-  │                     │                │  Routing      │              │               │              │              │
-  │                     │                │──────────────>│               │              │               │              │
-  │                     │                │  Idempotency  │              │               │              │              │
-  │                     │                │  (Redis SETNX)│              │               │              │              │
-  │                     │                │  Persist order│              │               │              │              │
-  │                     │                │  (CREATED)    │              │               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  1.Risk check (sync)         │               │              │              │
-  │                     │                │──────────────>│              │               │              │              │
-  │                     │                │  PASS→PENDING │              │               │              │              │
-  │                     │                │<──────────────│              │               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  2.Publish payment.created   │               │              │              │
-  │                     │                │────────────────────────────────────────────────────────────>│              │
-  │  201 Created        │                │               │              │               │              │              │
-  │<────────────────────│                │               │              │               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │  (async via Kafka consumer)    │              │               │              │              │
-  │                     │                │  3.Freeze     │              │               │              │              │
-  │                     │                │  (PROCESSING) │──────────────────────────────────────────> │              │
-  │                     │                │               │  freeze: OK  │               │              │              │
-  │                     │                │               │<─────────────│               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │               │  4.Ledger    │               │              │              │
-  │                     │                │──────────────────────────────────────────────────────────> │              │
-  │                     │                │               │  entry OK    │               │              │              │
-  │                     │                │               │<─────────────────────────────│              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  5.Transfer   │              │               │              │              │
-  │                     │                │─────────────────────────────>│               │              │              │
-  │                     │                │  transfer OK (COMPLETED)      │               │              │              │
-  │                     │                │<─────────────────────────────│               │              │              │
-  │                     │                │               │              │               │              │              │
-  │                     │                │  6.Publish payment.completed │               │              │              │
-  │                     │                │────────────────────────────────────────────────────────────>│              │
-  │                     │                │               │              │               │              │─────────────>│
-  │                     │                │               │              │               │              │  7.Webhook   │──> callback
+Client         Nginx          GatewaySvc     PaymentSvc     RiskSvc        Temporal       AccountSvc     LedgerSvc      Kafka          NotifySvc
+  │              │              │              │              │              │              │              │              │              │
+  │ POST /payments              │              │              │              │              │              │              │              │
+  │─────────────>│              │              │              │              │              │              │              │              │
+  │              │ proxy_pass   │              │              │              │              │              │              │              │
+  │              │─────────────>│              │              │              │              │              │              │              │
+  │              │              │ JWT auth     │              │              │              │              │              │              │
+  │              │              │ Limit 10r/s  │              │              │              │              │              │              │
+  │              │              │ Add Trace ID │              │              │              │              │              │              │
+  │              │              │ Routing      │              │              │              │              │              │              │
+  │              │              │─────────────>│              │              │              │              │              │              │
+  │              │              │              │ Idempotency  │              │              │              │              │              │
+  │              │              │              │ (Redis SETNX)│              │              │              │              │              │
+  │              │              │              │ Persist order│              │              │              │              │              │
+  │              │              │              │ (CREATED)    │              │              │              │              │              │
+  │              │              │              │              │              │              │              │              │              │
+  │              │              │              │ 1.Risk check │              │              │              │              │              │
+  │              │              │              │─────────────>│              │              │              │              │              │
+  │              │              │              │ PASS→PENDING │              │              │              │              │              │
+  │              │              │              │<─────────────│              │              │              │              │              │
+  │              │              │              │              │              │              │              │              │              │
+  │              │              │              │ 2.Start workflow payment-{id}              │              │              │              │
+  │              │              │              │────────────────────────────>│              │              │              │              │
+  │ 201 Created  │              │              │              │              │              │              │              │              │
+  │<───────────────────────────────────────────│              │              │              │              │              │              │
+  │              │              │              │              │              │              │              │              │              │
+  │              │              │              │              │              │ (async, Temporal activities)│              │              │
+  │              │              │              │ 3.markProcessing (PROCESSING)              │              │              │              │
+  │              │              │              │<────────────────────────────│              │              │              │              │
+  │              │              │              │              │              │ 4.freezeAmount              │              │              │
+  │              │              │              │              │              │─────────────>│              │              │              │
+  │              │              │              │              │              │ 5.createLedgerEntry         │              │              │
+  │              │              │              │              │              │────────────────────────────>│              │              │
+  │              │              │              │              │              │ 6.transfer   │              │              │              │
+  │              │              │              │              │              │─────────────>│              │              │              │
+  │              │              │              │ 7.markCompleted (COMPLETED) │              │              │              │              │
+  │              │              │              │<────────────────────────────│              │              │              │              │
+  │              │              │              │              │              │ 8.payment.completed         │              │              │
+  │              │              │              │              │              │───────────────────────────────────────────>│              │
+  │              │              │              │              │              │              │              │              │─────────────>│
+  │              │              │              │              │              │              │              │              │              │ 9.Webhook ──> callback
 ```
 
-**Failure compensation (Saga):** Failure handling splits into two paths depending on whether the transfer has already happened:
-- **Failure before transfer**: compensate in reverse order `reverseEntry → unfreezeAmount`, mark the status `FAILED` → publish `payment.failed`.
-- **Failure after transfer** (DB save or event publish error): the money has already moved, so **compensation is strictly forbidden**. Audit `RECONCILE_REQUIRED` and make a best-effort attempt to correct the order to `COMPLETED`; anything left over is handled by the reconciliation job.
+**Failure compensation (Saga):** `PaymentWorkflowImpl` uses Temporal's `Saga` class. Each forward step registers its exact inverse right after it succeeds, and on any failure in steps 3–7 (after Temporal retries are exhausted) the registered compensations run strictly in reverse order:
 
-**Kafka redelivery protection:** On entry, `processPaymentAsync` skips immediately if `status != PENDING` (prevents a double charge when the same offset is replayed after a consumer restart).
+| Forward step | Compensation |
+|---|---|
+| `freezeAmount` (available → frozen) | `unfreezeAmount` (frozen → available) |
+| `createLedgerEntry` | `reverseLedgerEntry` — appends a `REVERSAL` entry with debit/credit swapped (ledger rows are never deleted) |
+| `transfer` (payer frozen → payee available) | `reverseTransfer` (payee available → payer frozen) |
+
+So a failure after the transfer runs `reverseTransfer → reverseLedgerEntry → unfreezeAmount`, then `markFailed` → publish `payment.failed`. Because `reverseTransfer` puts the funds back into the payer's *frozen* balance, the following `unfreezeAmount` always releases exactly this payment's funds.
+
+**No compensation after completion:** once `markCompleted` succeeds the payment is final. `sendCompletedNotification` runs outside the Saga, so a Kafka publish failure never reverses a completed payment.
+
+**At-most-once execution:** the workflow ID is `payment-{paymentId}`, and a duplicate request short-circuits in `IdempotencyStep` before the workflow is started. Activities are retried at-least-once, so the status activities (`markProcessing` / `markCompleted` / `markFailed`) are no-ops when the order is already in the target status.
 
 ### 4.1 Payment State Machine
 
@@ -400,21 +415,29 @@ Hot account handling:
 └── Merged debits: batch requests for the same account
 ```
 
-### 5.5 Async + Event-Driven
+### 5.5 Async + Temporal Workflow Orchestration
 
 ```
-Sync path (user waits): risk check → freeze amount → return 202
-Async path (background): ledger entry → actual transfer → unfreeze → notify
+Sync path (user waits):   idempotency → persist order → risk check → start Temporal workflow → return 201
+Async path (Temporal):    markProcessing → freezeAmount → createLedgerEntry
+                          → transfer → markCompleted → sendCompletedNotification
+Saga compensation:        reverseTransfer → reverseLedgerEntry → unfreezeAmount
+                          → markFailed → sendFailedNotification
 
-Kafka topic design:
-├── payment.created     (Producer: payment-service; partitioned by from_account to preserve per-account ordering)
-├── payment.completed   (Producer: payment-service)
-├── payment.failed      (Producer: payment-service)
+Temporal workflow configuration:
+├── Task queue:        payment-workflow-queue
+├── Workflow ID:       payment-{paymentId}  (deterministic, at-most-once start)
+├── Activity retries:  maximumAttempts=3, startToCloseTimeout=30s
+└── Saga:              sequential compensation of every step that succeeded
+
+Kafka topic design (notifications only):
+├── payment.completed   (Producer: payment-service workflow activity)
+├── payment.failed      (Producer: payment-service workflow activity)
 └── notification.send   (Consumer: notification-service)
 
 Note: ledger.entry and risk.alert do not exist in the code.
-Ledger operations go through synchronous REST calls to ledger-service, not Kafka.
-Every event message carries an X-Trace-Id header so cross-process tracing is never lost.
+Ledger operations go through synchronous Feign calls to ledger-service, not Kafka.
+Every event message carries an X-Trace-Id header when one is present in MDC.
 ```
 
 ### 5.6 Optimistic Locking + Retry
@@ -457,7 +480,7 @@ static void rethrowIfClientError(Throwable cause) {
 | Gateway | `TraceIdFilter` generates a UUID (if the inbound request has no `X-Trace-Id`) |
 | Java services | `TraceFilter` (servlet, `HIGHEST_PRECEDENCE`) writes to SLF4J MDC; `logback-spring.xml` renders `[traceId=...]` |
 | Java Feign outbound | `FeignTraceInterceptor` automatically copies it from MDC to the header |
-| Kafka | `PaymentEventProducer` writes it to the message header; `PaymentEventConsumer` / Go consumer / Python middleware read it back |
+| Kafka | `PaymentEventProducer` writes it to the message header; the Go consumer reads it back |
 | Python (risk) | FastAPI `trace_middleware` propagates it and attaches it to logs |
 | Go (notification) | `extractTraceId(headers)` parses it from the Kafka header |
 
@@ -535,7 +558,7 @@ CREATE TABLE audit_log (
     id              BIGSERIAL PRIMARY KEY,
     trace_id        VARCHAR(64),                          -- Trace ID
     service_name    VARCHAR(50)  NOT NULL,
-    action          VARCHAR(100) NOT NULL,                -- e.g. FREEZE_AMOUNT / TRANSFER / RECONCILE_REQUIRED
+    action          VARCHAR(100) NOT NULL,                -- e.g. FREEZE_AMOUNT / TRANSFER / REVERSE_TRANSFER
     resource_type   VARCHAR(50)  NOT NULL,                -- PAYMENT / REFUND / ACCOUNT
     resource_id     VARCHAR(100),
     detail          TEXT,
@@ -613,7 +636,7 @@ payflow-engine/
 │       ├── controller/
 │       │   └── PaymentController.java          # REST API entry point (incl. request record DTOs)
 │       ├── service/
-│       │   ├── PaymentService.java             # Payment orchestration (main flow + async processing + Saga compensation)
+│       │   ├── PaymentService.java             # Payment creation (delegates to pipeline) + queries
 │       │   ├── RefundService.java              # Refund logic
 │       │   └── pipeline/
 │       │       ├── PaymentCreationPipeline.java # Pipeline orchestrator
@@ -623,7 +646,13 @@ payflow-engine/
 │       │           ├── IdempotencyStep.java     # Step 1: idempotency reservation
 │       │           ├── OrderPersistStep.java    # Step 2: order persistence
 │       │           ├── RiskCheckStep.java       # Step 3: risk check
-│       │           └── EventPublishStep.java    # Step 4: event publishing
+│       │           └── WorkflowStartStep.java   # Step 4: start Temporal workflow
+│       ├── workflow/
+│       │   ├── PaymentWorkflow.java            # Workflow interface
+│       │   ├── PaymentWorkflowImpl.java        # Workflow implementation (Saga orchestration)
+│       │   ├── PaymentActivities.java          # Activity interface (forward steps + compensations)
+│       │   ├── PaymentActivitiesImpl.java      # Activity implementations (Feign + Kafka + audit)
+│       │   └── PaymentWorkflowInput.java       # Workflow input DTO
 │       ├── dto/
 │       │   ├── CreatePaymentResponse.java
 │       │   ├── PaymentResponse.java
@@ -652,14 +681,15 @@ payflow-engine/
 │       │   ├── AuditService.java               # @Async writes, captures traceId automatically
 │       │   └── AuditController.java            # /api/v1/audit/{logs|trace|resource}
 │       ├── mq/
-│       │   ├── PaymentEventProducer.java       # Kafka producer (writes the X-Trace-Id header)
-│       │   └── PaymentEventConsumer.java       # Kafka consumer (reads X-Trace-Id, triggers processPaymentAsync)
+│       │   ├── PaymentEventProducer.java       # Kafka producer for notifications (writes the X-Trace-Id header)
+│       │   └── PaymentEventConsumer.java       # Deprecated stub — payment.created processing moved to Temporal
 │       ├── config/
 │       │   ├── IdempotencyFilter.java          # Idempotency interceptor (Redis SETNX)
 │       │   ├── KafkaConfig.java                # Kafka config
 │       │   ├── WebConfig.java                  # Web config
 │       │   ├── TraceFilter.java                # Inbound X-Trace-Id → MDC
-│       │   └── FeignTraceInterceptor.java      # Injects traceId into outbound Feign calls
+│       │   ├── FeignTraceInterceptor.java      # Injects traceId into outbound Feign calls
+│       │   └── TemporalConfig.java             # Temporal WorkflowClient + worker registration
 │       └── exception/
 │           ├── PaymentException.java
 │           └── GlobalExceptionHandler.java     # Incl. OptimisticLockException → 409
@@ -673,7 +703,7 @@ payflow-engine/
 │   └── src/main/java/com/payflow/account/
 │       ├── AccountApplication.java
 │       ├── controller/
-│       │   └── AccountController.java          # freeze / unfreeze / transfer / balance
+│       │   └── AccountController.java          # freeze / unfreeze / transfer / reverse-transfer / balance
 │       ├── service/
 │       │   └── AccountService.java             # TransactionTemplate + optimistic-lock retry (3 attempts)
 │       ├── domain/
@@ -779,6 +809,23 @@ The freeze model provides **two-phase commit** semantics: even if a downstream s
 └──────────────────────────────────────────────────────────┘
 ```
 
+### 8.5 Why Temporal instead of Kafka choreography?
+
+The earlier architecture coordinated fulfillment through Kafka event choreography (`payment.created` → consumer → hand-written try/catch with boolean flags). That approach had several problems:
+- The flow was spread across consumers, making the global state hard to trace
+- Process state was lost on a crash, with no way to resume from the last completed step
+- Retries and compensation (rollback) had to be implemented and maintained by hand
+
+Temporal **workflow orchestration** solves these:
+```
+Visibility:   Temporal UI shows every activity's status and full execution history
+Reliability:  built-in retries, timeouts, and deduplication (workflow ID = payment-{id})
+Compensation: Saga pattern — every forward step registers its exact inverse
+Durability:   workflow state is persisted, so execution resumes after a service restart
+```
+
+Kafka is kept for the final notification broadcast (`payment.completed` / `payment.failed` / `notification.send`), which is a natural pub/sub use case.
+
 ---
 
 ## 9. Local Setup Guide
@@ -801,8 +848,8 @@ The freeze model provides **two-phase commit** semantics: even if a downstream s
 git clone https://github.com/larryaus/payflow-engine.git
 cd payflow-engine
 
-# 2. Start the infrastructure (PostgreSQL + Redis + Kafka)
-docker-compose up -d postgres redis kafka
+# 2. Start the infrastructure (PostgreSQL + Redis + Kafka + Temporal)
+docker-compose up -d postgres redis kafka temporal temporal-ui
 
 # 3. Wait for the infrastructure to be ready (about 10-15 seconds)
 echo "Waiting for infrastructure..."
@@ -909,10 +956,12 @@ Once everything is up, the services listen on the following ports:
 │ Ledger Service                   │ 8083   │ http://localhost:8083    │
 │ Risk Service                     │ 8084   │ http://localhost:8084    │
 │ Notification Service             │ 8085   │ http://localhost:8085    │
+│ Temporal UI                      │ 8088   │ http://localhost:8088    │
 ├──────────────────────────────────┼────────┼──────────────────────────┤
 │ PostgreSQL                       │ 5432   │ localhost:5432           │
 │ Redis                            │ 6379   │ localhost:6379           │
 │ Kafka                            │ 9092   │ localhost:9092           │
+│ Temporal Server                  │ 7233   │ localhost:7233           │
 └──────────────────────────────────┴────────┴──────────────────────────┘
 ```
 

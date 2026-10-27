@@ -1,17 +1,10 @@
 package com.payflow.payment.service;
 
-import com.payflow.payment.audit.AuditService;
-import com.payflow.payment.client.AccountClient;
-import com.payflow.payment.client.LedgerClient;
 import com.payflow.payment.controller.PaymentController.CreatePaymentRequest;
 import com.payflow.payment.domain.PaymentOrder;
-import com.payflow.payment.domain.PaymentStatus;
 import com.payflow.payment.exception.PaymentException;
-import com.payflow.payment.mq.PaymentEventProducer;
 import com.payflow.payment.repository.PaymentOrderRepository;
 import com.payflow.payment.service.pipeline.PaymentCreationPipeline;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -21,9 +14,6 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 
-import java.time.Instant;
-import java.util.concurrent.TimeUnit;
-
 @Service
 public class PaymentService {
 
@@ -31,33 +21,19 @@ public class PaymentService {
 
     private final PaymentOrderRepository paymentOrderRepository;
     private final PaymentCreationPipeline paymentCreationPipeline;
-    private final AccountClient accountClient;
-    private final LedgerClient ledgerClient;
-    private final PaymentEventProducer eventProducer;
-    private final RedissonClient redissonClient;
-    private final AuditService auditService;
 
     public PaymentService(
             PaymentOrderRepository paymentOrderRepository,
-            PaymentCreationPipeline paymentCreationPipeline,
-            AccountClient accountClient,
-            LedgerClient ledgerClient,
-            PaymentEventProducer eventProducer,
-            RedissonClient redissonClient,
-            AuditService auditService) {
+            PaymentCreationPipeline paymentCreationPipeline) {
         this.paymentOrderRepository = paymentOrderRepository;
         this.paymentCreationPipeline = paymentCreationPipeline;
-        this.accountClient = accountClient;
-        this.ledgerClient = ledgerClient;
-        this.eventProducer = eventProducer;
-        this.redissonClient = redissonClient;
-        this.auditService = auditService;
     }
 
     /**
      * 创建支付订单 — 委托给 PaymentCreationPipeline 执行
      *
-     * 流水线顺序: 幂等占位 → 订单持久化 → 风控检查 → 事件发布
+     * 流水线顺序: 幂等占位 → 订单持久化 → 风控检查 → 启动 Temporal Workflow
+     * 冻结 → 记账 → 转账 → 通知 由 PaymentWorkflowImpl 异步编排
      */
     @Transactional
     public PaymentOrder createPayment(String idempotencyKey, CreatePaymentRequest request) {
@@ -66,144 +42,6 @@ public class PaymentService {
         } catch (Exception e) {
             log.error("Payment creation failed for idempotencyKey={}: {}", idempotencyKey, e.getMessage());
             throw e;
-        }
-    }
-
-    /**
-     * 异步处理支付 — 由 Kafka Consumer 触发
-     *
-     * Saga 补偿顺序 (逆序): reverseTransfer (若已转账) → reverseLedger (若已记账) → unfreeze (若已冻结)
-     * 补偿在标记失败/发送事件之前执行, 且每步独立 try-catch 防止补偿链中断.
-     */
-    public void processPaymentAsync(String paymentId) {
-        PaymentOrder order = getPayment(paymentId);
-
-        if (order.getStatus() != PaymentStatus.PENDING) {
-            log.info("Payment {} already in status {}, skipping async processing (duplicate delivery)",
-                    paymentId, order.getStatus());
-            return;
-        }
-
-        String lockKey = "account:lock:" + order.getFromAccount();
-        RLock lock = redissonClient.getLock(lockKey);
-
-        boolean froze = false;
-        boolean ledgerCreated = false;
-        boolean transferred = false;
-
-        try {
-            if (!lock.tryLock(5, 30, TimeUnit.SECONDS)) {
-                throw new PaymentException("ACCOUNT_BUSY", "账户繁忙,请稍后重试");
-            }
-
-            order.transitTo(PaymentStatus.PROCESSING);
-            paymentOrderRepository.save(order);
-
-            accountClient.freezeAmount(order.getFromAccount(), order.getAmount());
-            froze = true;
-            auditService.log("FREEZE_AMOUNT", "PAYMENT", paymentId,
-                    "account=" + order.getFromAccount() + " amount=" + order.getAmount(), "SUCCESS", null);
-
-            ledgerClient.createEntry(order.getPaymentId(),
-                    order.getFromAccount(), order.getToAccount(), order.getAmount());
-            ledgerCreated = true;
-            auditService.log("CREATE_LEDGER_ENTRY", "PAYMENT", paymentId,
-                    "debit=" + order.getFromAccount() + " credit=" + order.getToAccount(), "SUCCESS", null);
-
-            accountClient.transfer(order.getFromAccount(), order.getToAccount(), order.getAmount());
-            transferred = true;
-            auditService.log("TRANSFER", "PAYMENT", paymentId,
-                    "from=" + order.getFromAccount() + " to=" + order.getToAccount() + " amount=" + order.getAmount(), "SUCCESS", null);
-
-            order.transitTo(PaymentStatus.COMPLETED);
-            paymentOrderRepository.save(order);
-            eventProducer.sendPaymentCompleted(order);
-            auditService.log("PAYMENT_COMPLETED", "PAYMENT", paymentId, null, "SUCCESS", null);
-
-            log.info("Payment {} completed successfully", paymentId);
-
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            handleAsyncFailure(order, froze, ledgerCreated, transferred, "Lock interrupted");
-        } catch (Exception e) {
-            handleAsyncFailure(order, froze, ledgerCreated, transferred, e.getMessage());
-        } finally {
-            if (lock.isHeldByCurrentThread()) {
-                lock.unlock();
-            }
-        }
-    }
-
-    /**
-     * 失败处理 — 区分两种情况:
-     * 1. 转账已成功但收尾失败 (DB save / event publish): 资金已变动,绝不能补偿,
-     *    标记为需人工对账;尽力把状态修正为 COMPLETED.
-     * 2. 转账前失败: 走 Saga 补偿,把订单标记为 FAILED.
-     */
-    private void handleAsyncFailure(PaymentOrder order, boolean froze, boolean ledgerCreated,
-                                    boolean transferred, String reason) {
-        if (transferred) {
-            log.error("Payment {} post-transfer state update failed — manual reconciliation required: {}",
-                    order.getPaymentId(), reason);
-            auditService.log("RECONCILE_REQUIRED", "PAYMENT", order.getPaymentId(),
-                    "transfer succeeded but state save failed: " + reason, "FAILED", null);
-            tryFinalizeCompleted(order);
-            return;
-        }
-        compensate(order, froze, ledgerCreated);
-        handlePaymentFailure(order, reason);
-    }
-
-    /**
-     * 转账已成功的订单, 尝试把状态改成 COMPLETED.
-     * 失败也只是记录日志 — 由对账作业兜底, 不能再触发补偿.
-     */
-    private void tryFinalizeCompleted(PaymentOrder order) {
-        try {
-            PaymentOrder fresh = paymentOrderRepository.findByPaymentId(order.getPaymentId())
-                    .orElseThrow(() -> new PaymentException("NOT_FOUND",
-                            "Payment not found: " + order.getPaymentId()));
-            if (fresh.getStatus() == PaymentStatus.COMPLETED) {
-                return;
-            }
-            if (fresh.getStatus().canTransitTo(PaymentStatus.COMPLETED)) {
-                fresh.transitTo(PaymentStatus.COMPLETED);
-                paymentOrderRepository.save(fresh);
-                eventProducer.sendPaymentCompleted(fresh);
-                auditService.log("PAYMENT_COMPLETED", "PAYMENT", fresh.getPaymentId(),
-                        "finalized after post-transfer recovery", "SUCCESS", null);
-            } else {
-                log.error("Payment {} stuck in {} after successful transfer — manual intervention required",
-                        fresh.getPaymentId(), fresh.getStatus());
-            }
-        } catch (Exception ex) {
-            log.error("Payment {} finalize attempt failed: {}", order.getPaymentId(), ex.getMessage());
-        }
-    }
-
-    private void compensate(PaymentOrder order, boolean froze, boolean ledgerCreated) {
-        auditService.log("COMPENSATION_START", "PAYMENT", order.getPaymentId(),
-                "froze=" + froze + " ledgerCreated=" + ledgerCreated, "INFO", null);
-        if (ledgerCreated) {
-            try {
-                ledgerClient.reverseEntry(order.getPaymentId(),
-                        order.getFromAccount(), order.getToAccount(), order.getAmount());
-                auditService.log("REVERSE_LEDGER", "PAYMENT", order.getPaymentId(), null, "SUCCESS", null);
-            } catch (Exception ex) {
-                log.error("Payment {} compensation: ledger reversal failed — manual intervention required: {}",
-                        order.getPaymentId(), ex.getMessage());
-                auditService.log("REVERSE_LEDGER", "PAYMENT", order.getPaymentId(), ex.getMessage(), "FAILED", null);
-            }
-        }
-        if (froze) {
-            try {
-                accountClient.unfreezeAmount(order.getFromAccount(), order.getAmount());
-                auditService.log("UNFREEZE_AMOUNT", "PAYMENT", order.getPaymentId(), null, "SUCCESS", null);
-            } catch (Exception ex) {
-                log.error("Payment {} compensation: unfreeze failed — manual intervention required: {}",
-                        order.getPaymentId(), ex.getMessage());
-                auditService.log("UNFREEZE_AMOUNT", "PAYMENT", order.getPaymentId(), ex.getMessage(), "FAILED", null);
-            }
         }
     }
 
@@ -216,14 +54,5 @@ public class PaymentService {
     public PaymentOrder getPayment(String paymentId) {
         return paymentOrderRepository.findByPaymentId(paymentId)
                 .orElseThrow(() -> new PaymentException("NOT_FOUND", "Payment not found: " + paymentId));
-    }
-
-    private void handlePaymentFailure(PaymentOrder order, String reason) {
-        log.error("Payment {} failed: {}", order.getPaymentId(), reason);
-        order.transitTo(PaymentStatus.FAILED);
-        order.setUpdatedAt(Instant.now());
-        paymentOrderRepository.save(order);
-        eventProducer.sendPaymentFailed(order, reason);
-        auditService.log("PAYMENT_FAILED", "PAYMENT", order.getPaymentId(), reason, "FAILED", null);
     }
 }

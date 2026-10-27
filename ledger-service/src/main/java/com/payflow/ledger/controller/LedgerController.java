@@ -30,12 +30,9 @@ public class LedgerController {
 
     @PostMapping("/entries/reverse")
     public ResponseEntity<LedgerEntry> reverseEntry(
-            @RequestParam("reference_id") String referenceId,
-            @RequestParam("debit_account") String debitAccount,
-            @RequestParam("credit_account") String creditAccount,
-            @RequestParam("amount") Long amount) {
-        LedgerEntry entry = ledgerService.reverseEntry(referenceId, debitAccount, creditAccount, amount);
-        return ResponseEntity.status(HttpStatus.CREATED).body(entry);
+            @RequestParam("payment_id") String paymentId) {
+        LedgerEntry reversal = ledgerService.reverseEntry(paymentId);
+        return ResponseEntity.status(HttpStatus.CREATED).body(reversal);
     }
 
     @GetMapping("/entries")

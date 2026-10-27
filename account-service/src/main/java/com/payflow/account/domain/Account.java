@@ -83,4 +83,19 @@ public class Account {
         this.availableBalance += amount;
         this.updatedAt = Instant.now();
     }
+
+    /** 退回冻结: 资金回到冻结余额(debit 的逆操作，用于转账逆向补偿) */
+    public void restoreFrozen(Long amount) {
+        this.frozenBalance += amount;
+        this.updatedAt = Instant.now();
+    }
+
+    /** 退款扣除: 从可用余额中扣除(用于转账逆向补偿) */
+    public void deductAvailable(Long amount) {
+        if (availableBalance < amount) {
+            throw new IllegalStateException("Insufficient available balance for deduction");
+        }
+        this.availableBalance -= amount;
+        this.updatedAt = Instant.now();
+    }
 }

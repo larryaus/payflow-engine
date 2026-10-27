@@ -34,6 +34,29 @@ services:
     ports:
       - "9092:9092"
 
+  # ==================== Temporal ====================
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=payflow
+      - POSTGRES_PWD=payflow_secret
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"
+    depends_on:
+      - postgres
+
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "8088:8080"
+    depends_on:
+      - temporal
+
   # ==================== Services ====================
   payment-service:
     build: ./payment-service
@@ -50,10 +73,12 @@ services:
       SERVICES_ACCOUNT_URL: http://account-service:8082
       SERVICES_LEDGER_URL: http://ledger-service:8083
       SERVICES_RISK_URL: http://risk-service:8084
+      TEMPORAL_SERVICE_ADDRESS: temporal:7233
     depends_on:
       - postgres
       - redis
       - kafka
+      - temporal
 
   account-service:
     build: ./account-service

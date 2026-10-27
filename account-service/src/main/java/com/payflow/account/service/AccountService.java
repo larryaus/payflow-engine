@@ -67,6 +67,23 @@ public class AccountService {
         }));
     }
 
+    /**
+     * 逆向转账补偿: 从收款方可用余额扣回，退回付款方冻结余额 (transfer 的精确逆操作)
+     * 仅用于 Saga 补偿，之后由 unfreezeAmount 补偿把冻结资金释放回可用余额
+     */
+    public void reverseTransfer(String fromAccountId, String toAccountId, Long amount) {
+        retryOnOptimisticLock(() -> transactionTemplate.executeWithoutResult(status -> {
+            Account from = getAccount(fromAccountId);
+            Account to = getAccount(toAccountId);
+
+            to.deductAvailable(amount);
+            from.restoreFrozen(amount);
+
+            accountRepository.save(from);
+            accountRepository.save(to);
+        }));
+    }
+
     private void retryOnOptimisticLock(Runnable operation) {
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {

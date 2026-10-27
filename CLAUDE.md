@@ -8,19 +8,19 @@ PayFlow Engine is a **polyglot microservices payment platform** simulating a fin
 
 ## Architecture
 
-Seven services communicate via REST (sync) and Kafka (async):
+Seven services communicate via REST (sync) and Kafka (notifications), with Temporal orchestrating the async payment workflow:
 
 | Service | Language/Framework | Port | Role |
 |---|---|---|---|
 | `gateway-service` | Java 21 + Spring Cloud Gateway | 8080 | API gateway — routing, JWT auth, rate limiting, tracing |
-| `payment-service` | Java 21 + Spring Boot 3 | 8081 | Orchestrator — accepts payments, coordinates flow |
+| `payment-service` | Java 21 + Spring Boot 3 | 8081 | Orchestrator — accepts payments, starts Temporal workflow |
 | `account-service` | Java 21 + Spring Boot 3 | 8082 | Balance management — freeze/transfer/unfreeze |
 | `ledger-service` | Java 21 + Spring Boot 3 | 8083 | Double-entry accounting records |
 | `risk-service` | Python 3.12 + FastAPI | 8084 | Policy enforcement — blacklist, amount limits |
 | `notification-service` | Go 1.22 | 8085 | Event-driven webhook/notification delivery |
 | `frontend` | React 18 + TypeScript + Vite | 3000 | SPA — payments UI |
 
-**Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6 — KRaft mode, no ZooKeeper), Nginx
+**Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6), Nginx, Temporal 1.24
 
 **Rate limiting:** Gateway service (`gateway-service`) — Redis token bucket via Spring Cloud Gateway `RequestRateLimiter` filter, 10r/s per IP, burst capacity 20, key resolved from `X-Forwarded-For` / `X-Real-IP` / remote address.
 
@@ -30,47 +30,43 @@ Seven services communicate via REST (sync) and Kafka (async):
 - Gateway: `TraceIdFilter` generates UUID if missing.
 - Java services (payment / account / ledger): `TraceFilter` (servlet, `HIGHEST_PRECEDENCE`) reads the header, writes to SLF4J MDC under key `traceId`, echoes it on the response.
 - Outbound REST: `FeignTraceInterceptor` (payment-service) copies the MDC trace ID onto every Feign call.
-- Kafka: `PaymentEventProducer` writes `X-Trace-Id` as a message header; `PaymentEventConsumer` (Java) and `notification-service` (Go, `extractTraceId`) read it back into MDC / logs.
+- Kafka: `PaymentEventProducer` writes `X-Trace-Id` as a message header; `notification-service` (Go, `extractTraceId`) reads it back into its logs.
 - Python (`risk-service`): FastAPI `trace_middleware` propagates the header and attaches it to log records.
 - All Java services log with pattern `[traceId=%X{traceId:--}]` via `logback-spring.xml`.
 
 **Monitoring:** Every Java service exposes Spring Boot Actuator endpoints `health`, `info`, `metrics`, `env` (with `health.show-details=always`).
 
-**Audit trail:** payment-service writes an async `audit_log` row (table: `audit_log`, indexed by `trace_id`, `(resource_type, resource_id)`, `action`, `created_at`) at every key business point — payment creation, freeze, ledger create, transfer, completion, failure, compensation start, ledger reverse, unfreeze, reconcile-required. Queryable via `/api/v1/audit/...`.
+**Audit trail:** payment-service writes an async `audit_log` row (table: `audit_log`, indexed by `trace_id`, `(resource_type, resource_id)`, `action`, `created_at`) at every key business point — payment creation, freeze, ledger create, transfer, completion, failure, and each compensation step (transfer reverse, ledger reverse, unfreeze). Queryable via `/api/v1/audit/...`.
 
-### Payment Flow (Sync → Async)
+### Payment Flow (Sync → Temporal Workflow)
 
 **Synchronous path (returns 201 Created):**
 ```
 Client → Nginx → Gateway Service (JWT auth, rate limit, trace ID)
        → Payment Service
-       → IdempotencyStep  (Redis SETNX, 24h TTL; short-circuit on duplicate)
-       → OrderPersistStep (create PaymentOrder, status=CREATED)
-       → RiskCheckStep    (sync Feign → Risk Service; PASS→PENDING, FAIL→REJECTED+exception)
-       → EventPublishStep (publish payment.created to Kafka)
+       → IdempotencyStep   (Redis SETNX, 24h TTL; short-circuit on duplicate)
+       → OrderPersistStep  (create PaymentOrder, status=CREATED)
+       → RiskCheckStep     (sync Feign → Risk Service; PASS→PENDING, FAIL→REJECTED+exception)
+       → WorkflowStartStep (start Temporal PaymentWorkflow, workflow ID payment-{paymentId})
        → Return 201 Created
 ```
 
-**Asynchronous path (triggered by payment.created Kafka event):**
+**Asynchronous path (Temporal PaymentWorkflow, task queue: payment-workflow-queue):**
 ```
-Kafka consumer (payment.created)
-       → If order.status != PENDING → skip (Kafka redelivery dedupe)
-       → Acquire Redisson lock on fromAccount (tryLock 5s, hold max 30s)
-       → status → PROCESSING
-       → Account Service: freeze amount        (audit: FREEZE_AMOUNT)
-       → Ledger Service:  create double-entry  (audit: CREATE_LEDGER_ENTRY)
-       → Account Service: transfer             (audit: TRANSFER)  ← sets `transferred = true`
-       → status → COMPLETED, publish payment.completed
-       → Notification Service: webhook callback
+  1. markProcessing            — status → PROCESSING
+  2. freezeAmount              — hold funds on source account     (audit: FREEZE_AMOUNT)
+  3. createLedgerEntry         — double-entry bookkeeping          (audit: CREATE_LEDGER_ENTRY)
+  4. transfer                  — execute fund movement             (audit: TRANSFER)
+  5. markCompleted             — status → COMPLETED                (audit: PAYMENT_COMPLETED)
+  6. sendCompletedNotification — publish payment.completed → Notification Service (webhook)
 
-On failure (split by whether transfer already succeeded):
-  PRE-transfer failure → Saga compensation (reverse order, each step independent try-catch):
-       → reverseEntry   (if ledger was created)
-       → unfreezeAmount (if account was frozen)
-       → status → FAILED, publish payment.failed
-  POST-transfer failure (DB save / event publish) → DO NOT compensate:
-       → audit: RECONCILE_REQUIRED (manual intervention)
-       → tryFinalizeCompleted: best-effort re-save status=COMPLETED + republish event
+On failure in steps 1–5 (after Temporal retries are exhausted):
+  Saga compensation, strictly in reverse order of the steps that succeeded:
+       → reverseTransfer    (if transfer succeeded)    (audit: REVERSE_TRANSFER)
+       → reverseLedgerEntry (if ledger was created)    (audit: REVERSE_LEDGER)
+       → unfreezeAmount     (if account was frozen)    (audit: UNFREEZE_AMOUNT)
+       → markFailed (status → FAILED, audit: PAYMENT_FAILED) → sendFailedNotification (payment.failed)
+  Step 6 runs outside the Saga: once the order is COMPLETED, a notification failure never compensates.
 ```
 
 ---
@@ -88,17 +84,23 @@ payflow-engine/
 ├── payment-service/          # Java Spring Boot — payment orchestration
 │   └── src/main/java/com/payflow/payment/
 │       ├── controller/       # REST endpoints + request record DTOs
-│       ├── service/          # PaymentService, RefundService
+│       ├── service/          # PaymentService (starts Temporal workflow), RefundService
 │       │   └── pipeline/     # PaymentCreationPipeline + steps
-│       │       └── step/     # IdempotencyStep, OrderPersistStep, RiskCheckStep, EventPublishStep
+│       │       └── step/     # IdempotencyStep, OrderPersistStep, RiskCheckStep, WorkflowStartStep
+│       ├── workflow/         # Temporal workflow + activities
+│       │   ├── PaymentWorkflow.java         # Workflow interface
+│       │   ├── PaymentWorkflowImpl.java     # Saga orchestration logic
+│       │   ├── PaymentActivities.java       # Activity interface (11 activities incl. compensations)
+│       │   ├── PaymentActivitiesImpl.java   # Activity implementations
+│       │   └── PaymentWorkflowInput.java    # Workflow input DTO
 │       ├── dto/              # Response DTOs (CreatePaymentResponse, PaymentResponse, etc.)
 │       ├── domain/           # JPA entities + state machine (PaymentStatus, RefundStatus)
 │       ├── repository/       # Spring Data JPA repos
 │       ├── client/           # Feign clients + FallbackFactory + FallbackPolicy (4xx propagation)
 │       ├── audit/            # AuditController, AuditLog, AuditLogRepository, AuditService (@Async)
-│       ├── config/           # IdempotencyFilter, KafkaConfig, WebConfig, TraceFilter, FeignTraceInterceptor
+│       ├── config/           # IdempotencyFilter, KafkaConfig, WebConfig, TemporalConfig, TraceFilter, FeignTraceInterceptor
 │       ├── exception/        # PaymentException, GlobalExceptionHandler (incl. 409 OptimisticLockException)
-│       └── mq/               # PaymentEventProducer, PaymentEventConsumer (both propagate X-Trace-Id)
+│       └── mq/               # PaymentEventProducer (completed/failed notifications, propagates X-Trace-Id)
 │   └── src/main/resources/
 │       ├── application.yml   # Resilience4j circuit breaker + Actuator config
 │       └── logback-spring.xml # Log pattern with [traceId=...]
@@ -167,8 +169,8 @@ payflow-engine/
 # Start everything (all services + infra)
 docker-compose up -d
 
-# Start infrastructure only (postgres, redis, kafka)
-docker-compose up -d postgres redis kafka
+# Start infrastructure only (postgres, redis, kafka, temporal)
+docker-compose up -d postgres redis kafka temporal temporal-ui
 ```
 
 ### Running Individual Services
@@ -235,7 +237,7 @@ go build ./...
 - **Naming:** PascalCase classes, camelCase methods, UPPER_SNAKE_CASE enum values
 - **Amounts:** Always use `BIGINT` (cents/smallest currency unit) — never floating-point for money
 - **Optimistic locking:** Both `Account` and `PaymentOrder` carry JPA `@Version`. **Do not initialize the version field** (leave it `null`) — Spring Data treats a non-null `@Version` as "not new" and routes `save()` to `merge()`, which on a null id triggers a duplicate-insert. The DB column has `DEFAULT 0`.
-- **Optimistic-lock retries:** `AccountService` wraps `freeze` / `unfreeze` / `transfer` in `TransactionTemplate.executeWithoutResult` and retries up to 3 times on `ObjectOptimisticLockingFailureException` — each retry runs in a fresh transaction. `GlobalExceptionHandler` (account + payment) maps the exception to **409 Conflict**.
+- **Optimistic-lock retries:** `AccountService` wraps `freeze` / `unfreeze` / `transfer` / `reverseTransfer` in `TransactionTemplate.executeWithoutResult` and retries up to 3 times on `ObjectOptimisticLockingFailureException` — each retry runs in a fresh transaction. `GlobalExceptionHandler` (account + payment) maps the exception to **409 Conflict**.
 - **Idempotency:** `IdempotencyFilter` / `IdempotencyStep` uses Redis SETNX with 24h TTL — payment endpoints are protected automatically
 - **Distributed locks:** Use Redisson (not raw Redis) for account-level operations — `tryLock(5, 30, TimeUnit.SECONDS)`
 - **State transitions:** `PaymentStatus` has `canTransitTo()` — always call `order.transitTo(target)` to enforce state machine; never assign status directly
@@ -243,11 +245,13 @@ go build ./...
 - **Feign resilience:** Each Feign client has a paired `*FallbackFactory` for Resilience4j circuit breaker fallback — register fallbacks when adding new clients
 - **Feign 4xx propagation:** `AccountClientFallbackFactory` and `LedgerClientFallbackFactory` call `FallbackPolicy.rethrowIfClientError(cause)` first — a `FeignException` with status 400-499 means the upstream is healthy and returned a business error, so it must propagate unchanged. Only 5xx, network errors, and circuit-open should fall back to `SERVICE_UNAVAILABLE`. `RiskClientFallbackFactory` is intentionally NOT wrapped — its fail-safe (reject when risk check is unavailable) is correct for any error type.
 - **Circuit breaker:** Configured in `payment-service/src/main/resources/application.yml` — sliding window 10, failure threshold 50%, open wait 30s
-- **Kafka topics published** via `PaymentEventProducer`: `payment.created` (partitioned by `from_account`), `payment.completed`, `payment.failed`. All carry an `X-Trace-Id` header. Note: `ledger.entry` and `risk.alert` do NOT exist — ledger operations use synchronous REST calls, not Kafka
+- **Kafka topics published** via `PaymentEventProducer`: `payment.completed`, `payment.failed` (from the workflow's notification activities). Both carry an `X-Trace-Id` header when one is in MDC. `payment.created` is no longer consumed — fulfillment is driven by Temporal, not Kafka. Note: `ledger.entry` and `risk.alert` do NOT exist — ledger operations use synchronous REST calls, not Kafka
 - **Kafka topics consumed** by notification-service: `payment.completed`, `payment.failed`, `notification.send`
-- **Kafka redelivery dedupe:** `processPaymentAsync` short-circuits if `order.status != PENDING` — we observed Kafka retrying offsets after consumer restart, and re-running the flow on a `COMPLETED` order would double-spend.
 - **Response DTOs:** Controllers return DTO objects from the `dto/` package — do not return raw entities
-- **Audit logging:** Inject `AuditService` and call `auditService.log(action, resourceType, resourceId, detail, result, clientIp)` at every state change in financial flows. The call is `@Async` and reads `traceId` from MDC automatically — never block the main flow on it.
+- **Temporal workflows:** Started by `WorkflowStartStep` (last step of the creation pipeline) via the `WorkflowClient` from `TemporalConfig` — task queue `payment-workflow-queue`, workflow ID format `payment-{paymentId}`
+- **Temporal activities:** Implement in `PaymentActivitiesImpl` — call Feign clients directly; retries (max 3) and timeouts (30s) are configured in `PaymentWorkflowImpl`. Activities are retried at-least-once, so keep them idempotent (the `mark*` activities no-op if the order is already in the target status)
+- **Saga compensation:** Register the compensation with `saga.addCompensation(...)` right after each forward step succeeds — never skip this (see *Saga Compensation* below)
+- **Audit logging:** Inject `AuditService` and call `auditService.log(action, resourceType, resourceId, detail, result, clientIp)` at every state change in financial flows. The call is `@Async` and reads `traceId` from MDC automatically — never block the main flow on it. Temporal activities run on worker threads with no MDC, so their audit rows have no trace ID; query them by resource (`PAYMENT` + payment ID)
 - **Trace propagation:** Inbound HTTP → `TraceFilter` populates MDC. Outbound Feign → `FeignTraceInterceptor` copies MDC → header. Outbound Kafka → `PaymentEventProducer` writes header. New inter-service paths must preserve this chain.
 
 ### Payment Creation Pipeline
@@ -255,19 +259,24 @@ go build ./...
 Payment creation is orchestrated by `PaymentCreationPipeline` which runs steps in order. Any step can set `ctx.shortCircuit()` to skip remaining steps:
 
 ```
-IdempotencyStep → OrderPersistStep → RiskCheckStep → EventPublishStep
+IdempotencyStep → OrderPersistStep → RiskCheckStep → WorkflowStartStep
 ```
 
-Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting into the pipeline constructor in order.
+`WorkflowStartStep` hands the accepted order to Temporal for async fulfillment. Because a duplicate request short-circuits in `IdempotencyStep`, the workflow is started at most once per order. Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting into the pipeline constructor in order.
 
 ### Saga Compensation
 
-`processPaymentAsync` (triggered by `payment.created` Kafka event) tracks three boolean flags (`froze`, `ledgerCreated`, `transferred`). The failure handler **branches by `transferred`**:
+`PaymentWorkflowImpl` uses Temporal's `io.temporal.workflow.Saga` with sequential compensation (`setParallelCompensation(false)`). Each forward step registers its exact inverse right after it succeeds:
 
-- **Pre-transfer failure** (`transferred=false`): `compensate()` reverses in reverse order — ledger reversal first (if created), then unfreeze (if frozen). Each compensation step has its own try-catch so one failure does not abort the rest. The order is then transitioned to `FAILED` and `payment.failed` is published.
-- **Post-transfer failure** (`transferred=true`, but the subsequent DB save / event publish failed): money has already moved — **never compensate**. Audit `RECONCILE_REQUIRED`, then `tryFinalizeCompleted()` re-reads the order in a fresh fetch and best-effort transitions it to `COMPLETED`. A missed finalization is left to the reconciliation job, never to compensation.
+| Step | Compensation |
+|---|---|
+| `freezeAmount` (available → frozen) | `unfreezeAmount` (frozen → available) |
+| `createLedgerEntry` | `reverseLedgerEntry` — appends a `REVERSAL` entry with debit/credit swapped (ledger rows are never deleted) |
+| `transfer` (payer frozen → payee available) | `reverseTransfer` (payee available → payer frozen) |
 
-This split exists because earlier code ran `compensate()` from any catch block, so a post-transfer save failure would reverse the ledger and try to unfreeze a now-empty frozen balance, leaving books inconsistent.
+On any failure in steps 1–5, `saga.compensate()` runs the registered compensations in reverse order, then `markFailed` and `sendFailedNotification`. Because `reverseTransfer` returns the funds to the payer's *frozen* balance, the following `unfreezeAmount` always has the funds it needs to release — compensation never touches another payment's frozen funds.
+
+Once `markCompleted` succeeds the payment is final: `sendCompletedNotification` runs outside the Saga `try` block, so a Kafka publish failure never reverses a completed payment.
 
 ### TypeScript / React (Frontend)
 
@@ -325,7 +334,7 @@ This split exists because earlier code ran `compensate()` from any catch block, 
 Every payment request must include `Idempotency-Key` header. The `IdempotencyStep` in the payment creation pipeline checks Redis with SETNX before processing. Same key within 24h returns cached response.
 
 ### 2. Freeze-Then-Transfer Model (Async)
-Account operations happen asynchronously after `payment.created` is consumed: `freeze → ledger → transfer`. On failure, Saga compensation runs in reverse. Never do a direct transfer without freeze. Never skip compensation on failure.
+Account operations happen asynchronously inside the Temporal `PaymentWorkflow`: `freeze → ledger → transfer`. On failure, Saga compensation runs in reverse. Never do a direct transfer without freeze. Never skip compensation on failure.
 
 ### 3. Double-Entry Ledger
 Every financial movement creates a pair of ledger entries (debit account + credit account). Amounts must balance. `LedgerService.verifyBalance()` checks this globally. `reverseEntry` is used for Saga compensation.
@@ -341,8 +350,8 @@ FAILED / REJECTED / REFUNDED → (terminal, no transitions)
 ```
 Always use `order.transitTo(target)` — never assign status directly.
 
-### 5. Event-Driven Async Processing
-Payment acceptance (201) is decoupled from fulfillment. The pipeline publishes `payment.created` and returns immediately — downstream processing (freeze, ledger, transfer, notifications) happens asynchronously via Kafka.
+### 5. Temporal Workflow Orchestration (Saga Pattern)
+Payment acceptance (201) is decoupled from fulfillment. After risk check, payment-service starts a Temporal workflow and returns immediately. The workflow orchestrates all downstream steps as activities (freeze → ledger → transfer → complete). On any activity failure, the workflow runs Saga compensation in reverse (`reverseTransfer` → `reverseLedgerEntry` → `unfreezeAmount`) before marking the payment FAILED. Workflow ID `payment-{paymentId}` ensures at-most-once execution. Monitor workflow executions at http://localhost:8088 (Temporal UI).
 
 ### 6. Circuit Breaker (Resilience4j)
 All Feign clients in payment-service have circuit breakers configured in `application.yml`. Each client also has a `*FallbackFactory` that throws `PaymentException("SERVICE_UNAVAILABLE", ...)` when the circuit is open or the upstream is unreachable. **4xx responses (real business errors) propagate unchanged** via `FallbackPolicy.rethrowIfClientError` — they are not "service unavailable" events.
@@ -388,12 +397,13 @@ All Java services additionally expose `/actuator/health`, `/actuator/info`, `/ac
 | POST | `/api/v1/accounts/freeze` | Freeze amount — query params: `account_id`, `amount` |
 | POST | `/api/v1/accounts/unfreeze` | Release frozen amount — query params: `account_id`, `amount` |
 | POST | `/api/v1/accounts/transfer` | Execute transfer — query params: `from_account`, `to_account`, `amount` |
+| POST | `/api/v1/accounts/reverse-transfer` | Reverse a transfer (Saga compensation only) — same query params |
 
 ### Ledger Service (port 8083)
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/v1/ledger/entries` | Create double-entry record — query params: `reference_id`, `debit_account`, `credit_account`, `amount` |
-| POST | `/api/v1/ledger/entries/reverse` | Reverse a ledger entry (Saga compensation) — same query params |
+| POST | `/api/v1/ledger/entries/reverse` | Reverse a payment's ledger entry (Saga compensation) — query param: `payment_id` |
 | GET | `/api/v1/ledger/entries` | Get entries by payment — query param: `payment_id` |
 | GET | `/api/v1/ledger/verify` | Verify global debit/credit balance |
 
