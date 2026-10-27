@@ -1,6 +1,6 @@
-# PayFlow Engine - 银行支付流系统
+# PayFlow Engine - Bank Payment Flow System
 
-## 1. 系统架构总览
+## 1. System Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -11,68 +11,83 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    Frontend — Nginx (port 3000 / 80)                        │
 │   ┌──────────────────────┐  ┌────────────────────────────────────────┐      │
-│   │ 静态资源 (React SPA)  │  │ 反向代理 + 限流 (10r/s per IP, burst=20)│      │
+│   │ React SPA (static)   │  │ Reverse proxy → Gateway Service        │      │
 │   └──────────────────────┘  └────────────────────────────────────────┘      │
-└──────────┬──────────────────────────────┬───────────────────────────────────┘
-           │ /api/v1/payments             │ /api/v1/accounts
-           ▼                              ▼
-┌──────────────────┐          ┌──────────────────┐  ┌──────────────────────┐
-│  Payment Service │          │  Account Service │  │  Notification Service│
-│  (支付核心服务)   │          │  (账户服务)       │  │  (通知服务)           │
-│                  │          │                  │  │                      │
-│ - 支付下单       │          │ - 账户余额查询    │  │ - Webhook 回调       │
-│ - 支付状态查询   │          │ - 账户冻结/解冻   │  │                      │
-│ - 退款处理       │          │ - 转账           │  │                      │
-└────────┬─────────┘          └──────────────────┘  └──────────────────────┘
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │ /api/*
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               Gateway Service — Spring Cloud Gateway (port 8080)            │
+│   ┌──────────────────┐ ┌───────────────┐ ┌──────────────┐ ┌───────────────┐ │
+│   │ JWT Bearer auth  │ │ Redis limiter │ │ Trace ID     │ │ Request log   │ │
+│   │ (off by default) │ │ (10r/s/IP)    │ │ (X-Trace-Id) │ │ (method/path) │ │
+│   └──────────────────┘ └───────────────┘ └──────────────┘ └───────────────┘ │
+└──────┬──────────┬──────────┬──────────┬──────────┬──────────────────────────┘
+       │          │          │          │          │
+       ▼          ▼          ▼          ▼          ▼
+┌────────────┐┌────────────┐┌────────────┐┌────────────┐┌──────────────────┐
+│  Payment   ││  Account   ││  Ledger    ││  Risk      ││  Notification    │
+│  Service   ││  Service   ││  Service   ││  Service   ││  Service         │
+│  (8081)    ││  (8082)    ││  (8083)    ││  (8084)    ││  (8085)          │
+│            ││            ││            ││            ││                  │
+│  Audit /   ││  Actuator  ││  Actuator  ││  Trace mw  ││  Trace from      │
+│  Actuator  ││  /Trace    ││  /Trace    ││  (FastAPI) ││  Kafka headers   │
+└────────┬───┘└────────────┘└────────────┘└────────────┘└──────────────────┘
+         │   X-Trace-Id across processes: HTTP header → MDC → Feign interceptor → Kafka header → Go/Python
+         │   All logs carry [traceId=...]; payment-service writes the audit_log table asynchronously
          │ (sync Feign)
-         ├──────────────────> Risk Service (风控规则引擎)
-         │                    - 黑名单检查 / 限额管理
+         ├──────────────────> Risk Service (risk rule engine)
+         │                    - Blacklist check / amount limits
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Temporal Server (port 7233)                              │
+│                         Temporal Server (port 7233)                         │
 │  Workflow: PaymentWorkflow  |  Task Queue: payment-workflow-queue           │
-│  Activities: freeze → ledger → transfer → complete/compensate              │
+│  Activities: freeze → ledger → transfer → complete / Saga compensation      │
 └──────────────────────────────┬──────────────────────────────────────────────┘
                                │ workflow activities (sync Feign)
          ┌─────────────────────┼─────────────────────┐
          ▼                     ▼                      ▼
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐
-│  Account Service │  │  Ledger Service  │  │  Kafka (Notification)│
-│  freeze/transfer │  │  double-entry    │  │  notification.send   │
-└──────────────────┘  └──────────────────┘  └──────────────────────┘
+┌────────────────────┐  ┌────────────────────┐  ┌──────────────────────────────┐
+│  Account Service   │  │  Ledger Service    │  │  Kafka (notifications)       │
+│  freeze / transfer │  │  double-entry      │  │  payment.completed           │
+│  + reverse         │  │  + reversal        │  │  payment.failed              │
+│                    │  │                    │  │  notification.send           │
+└────────────────────┘  └────────────────────┘  └──────────────────────────────┘
 
-┌──────────────────┐  ┌──────────────┐
-│  PostgreSQL      │  │  Redis       │
-│  (主数据库)       │  │  (缓存/锁)   │
-│                  │  │              │
-│ - 支付订单表     │  │ - 幂等性控制  │
-│ - 账户表         │  │ - 分布式锁   │
-│ - 分录表         │  │              │
-│ - 退款表         │  │              │
-└──────────────────┘  └──────────────┘
+┌────────────────────┐  ┌────────────────────┐
+│  PostgreSQL        │  │  Redis             │
+│  (primary DB)      │  │  (cache / locks /  │
+│                    │  │   rate limiting)   │
+│ - Payment orders   │  │ - Idempotency      │
+│ - Accounts         │  │ - Distributed lock │
+│ - Ledger entries   │  │ - Gateway limiter  │
+│ - Refunds          │  │                    │
+│ - Audit log        │  │                    │
+└────────────────────┘  └────────────────────┘
 ```
 
 ---
 
-## 2. 微服务拆分
+## 2. Microservices
 
-| 服务名 | 职责 | 技术栈 | 端口 |
-|--------|------|--------|------|
-| `frontend` | 前端 SPA + Nginx 反向代理（限流 10r/s per IP） | React + TypeScript + Ant Design + Nginx | 3000 |
-| `payment-service` | 支付核心流程（下单、查询、退款） | Java 21 + Spring Boot 3 | 8081 |
-| `account-service` | 账户管理、余额查询、冻结解冻、转账 | Java 21 + Spring Boot 3 | 8082 |
-| `ledger-service` | 复式记账、分录管理 | Java 21 + Spring Boot 3 | 8083 |
-| `risk-service` | 风控规则引擎、黑名单、限额 | Python 3.12 + FastAPI | 8084 |
-| `notification-service` | Webhook 回调通知 | Go 1.22 | 8085 |
-| `temporal` | 工作流编排引擎（支付流程 Saga） | Temporal 1.24 | 7233 |
-| `temporal-ui` | Temporal 可视化控制台 | Temporal UI 2.26 | 8088 |
+| Service | Responsibility | Tech Stack | Port |
+|---------|----------------|------------|------|
+| `frontend` | Frontend SPA + Nginx reverse proxy | React + TypeScript + Ant Design + Nginx | 3000 |
+| `gateway-service` | API gateway (routing, JWT auth, rate limiting, distributed tracing) | Java 21 + Spring Cloud Gateway | 8080 |
+| `payment-service` | Core payment flow (create, query, refund) | Java 21 + Spring Boot 3 | 8081 |
+| `account-service` | Account management, balance queries, freeze/unfreeze, transfers | Java 21 + Spring Boot 3 | 8082 |
+| `ledger-service` | Double-entry bookkeeping, ledger entry management | Java 21 + Spring Boot 3 | 8083 |
+| `risk-service` | Risk rule engine, blacklist, amount limits | Python 3.12 + FastAPI | 8084 |
+| `notification-service` | Webhook callback notifications | Go 1.22 | 8085 |
+| `temporal` | Workflow orchestration engine (payment Saga) | Temporal 1.24 | 7233 |
+| `temporal-ui` | Temporal web console | Temporal UI 2.26 | 8088 |
 
 ---
 
-## 3. API 设计
+## 3. API Design
 
-### 3.1 支付下单
+### 3.1 Create Payment
 
 ```
 POST /api/v1/payments
@@ -83,10 +98,10 @@ Request:
 {
   "from_account": "ACC_001",
   "to_account": "ACC_002",
-  "amount": 10000,           // 单位: 分(cent), 避免浮点精度问题
+  "amount": 10000,           // Unit: cents, avoids floating-point precision issues
   "currency": "CNY",
   "payment_method": "BANK_TRANSFER",
-  "memo": "货款支付",
+  "memo": "Payment for goods",
   "callback_url": "https://merchant.com/webhook/payment"
 }
 
@@ -98,7 +113,7 @@ Response 201 Created:
 }
 ```
 
-### 3.2 查询支付状态
+### 3.2 Get Payment Status
 
 ```
 GET /api/v1/payments/{payment_id}
@@ -116,7 +131,7 @@ Response 200:
 }
 ```
 
-### 3.3 退款
+### 3.3 Refund
 
 ```
 POST /api/v1/payments/{payment_id}/refund
@@ -124,8 +139,8 @@ Idempotency-Key: {uuid}
 
 Request:
 {
-  "amount": 5000,              // 支持部分退款
-  "reason": "商品退货"
+  "amount": 5000,              // Partial refunds are supported
+  "reason": "Goods returned"
 }
 
 Response 201 Created:
@@ -137,7 +152,7 @@ Response 201 Created:
 }
 ```
 
-### 3.4 查询退款列表
+### 3.4 List Refunds
 
 ```
 GET /api/v1/payments/{payment_id}/refunds
@@ -148,7 +163,7 @@ Response 200:
     "refund_id": "REF_20260322_xyz",
     "payment_id": "PAY_20260322_abcdef",
     "amount": 5000,
-    "reason": "商品退货",
+    "reason": "Goods returned",
     "status": "COMPLETED",
     "created_at": "2026-03-22T10:01:00Z",
     "completed_at": "2026-03-22T10:01:30Z"
@@ -156,7 +171,7 @@ Response 200:
 ]
 ```
 
-### 3.5 账户列表
+### 3.5 List Accounts
 
 ```
 GET /api/v1/accounts
@@ -165,7 +180,7 @@ Response 200:
 [
   {
     "account_id": "ACC_001",
-    "account_name": "测试账户1",
+    "account_name": "Test Account 1",
     "available_balance": 500000,
     "frozen_balance": 0,
     "currency": "CNY",
@@ -174,7 +189,7 @@ Response 200:
 ]
 ```
 
-### 3.6 账户余额查询
+### 3.6 Get Account Balance
 
 ```
 GET /api/v1/accounts/{account_id}/balance
@@ -182,95 +197,146 @@ GET /api/v1/accounts/{account_id}/balance
 Response 200:
 {
   "account_id": "ACC_001",
-  "available_balance": 500000,   // 可用余额(分)
-  "frozen_balance": 10000,       // 冻结余额(分)
+  "available_balance": 500000,   // Available balance (cents)
+  "frozen_balance": 10000,       // Frozen balance (cents)
   "currency": "CNY",
   "updated_at": "2026-03-22T10:00:00Z"
 }
 ```
 
+### 3.7 Audit Log Queries
+
+```
+GET /api/v1/audit/logs?page=1&size=20         # Page through all entries
+GET /api/v1/audit/trace/{traceId}             # Replay every operation in a trace by trace ID
+GET /api/v1/audit/resource?resource_type=PAYMENT&resource_id=PAY_xxx  # Query by resource
+
+Response 200 (example):
+[
+  {
+    "id": 42,
+    "trace_id": "8f4c1e2a3b...",
+    "service_name": "payment-service",
+    "action": "FREEZE_AMOUNT",
+    "resource_type": "PAYMENT",
+    "resource_id": "PAY_20260501_xxx",
+    "detail": "account=acc001 amount=10000",
+    "result": "SUCCESS",
+    "created_at": "2026-05-01T10:00:01Z"
+  }
+]
+```
+
+### 3.8 Monitoring Endpoints (all Java services)
+
+```
+GET /actuator/health      # Health check (with details)
+GET /actuator/info        # Service info
+GET /actuator/metrics     # Metrics
+GET /actuator/env         # Environment variables
+```
+
 ---
 
-## 4. Payment Flow (支付流程)
+## 4. Payment Flow
 
-支付流程现在由 **Temporal 工作流**编排（取代原来的 Kafka 编舞模式）：
+Fulfillment is orchestrated by a **Temporal workflow** (replacing the earlier Kafka choreography). The synchronous request ends once risk passes and the workflow is started; Temporal then drives every downstream step as an activity.
 
 ```
-Client          Nginx           PaymentSvc      RiskSvc     Temporal       AccountSvc    LedgerSvc     Kafka        NotifySvc
-  │               │                │               │             │              │             │             │             │
-  │ POST /payments│                │               │             │              │             │             │             │
-  │──────────────>│                │               │             │              │             │             │             │
-  │               │ 限流(10r/s)    │               │             │              │             │             │             │
-  │               │───────────────>│               │             │              │             │             │             │
-  │               │                │ 幂等检查(Redis)│             │              │             │             │             │
-  │               │                │ 1.风控检查    │             │              │             │             │             │
-  │               │                │──────────────>│             │              │             │             │             │
-  │               │                │  PASS         │             │              │             │             │             │
-  │               │                │<──────────────│             │              │             │             │             │
-  │               │                │ 2.启动 Workflow│             │              │             │             │             │
-  │               │                │──────────────────────────>  │              │             │             │             │
-  │  202 Accepted │                │               │             │              │             │             │             │
-  │<──────────────│                │               │             │              │             │             │             │
-  │               │                │               │  (async)    │              │             │             │             │
-  │               │                │               │             │ 3.markProcessing            │             │             │
-  │               │                │               │             │──────────────────────────────────────────────────────> │
-  │               │                │               │             │ 4.freezeAmount│             │             │             │
-  │               │                │               │             │─────────────>│             │             │             │
-  │               │                │               │             │ 5.createLedger│             │             │             │
-  │               │                │               │             │──────────────────────────>  │             │             │
-  │               │                │               │             │ 6.transfer    │             │             │             │
-  │               │                │               │             │─────────────>│             │             │             │
-  │               │                │               │             │ 7.markCompleted             │             │             │
-  │               │                │               │             │ 8.sendNotification          │             │             │
-  │               │                │               │             │─────────────────────────────────────────>│             │
-  │               │                │               │             │              │             │             │────────────>│
-  │               │                │               │             │              │             │             │  Webhook    │──> callback
-  │               │                │               │             │              │             │             │             │
-  │               │ (on failure)   │               │             │              │             │             │             │
-  │               │                │               │             │ unfreezeAmount(compensation)│             │             │
-  │               │                │               │             │─────────────>│             │             │             │
-  │               │                │               │             │ markFailed   │             │             │             │
+Client         Nginx          GatewaySvc     PaymentSvc     RiskSvc        Temporal       AccountSvc     LedgerSvc      Kafka          NotifySvc
+  │              │              │              │              │              │              │              │              │              │
+  │ POST /payments              │              │              │              │              │              │              │              │
+  │─────────────>│              │              │              │              │              │              │              │              │
+  │              │ proxy_pass   │              │              │              │              │              │              │              │
+  │              │─────────────>│              │              │              │              │              │              │              │
+  │              │              │ JWT auth     │              │              │              │              │              │              │
+  │              │              │ Limit 10r/s  │              │              │              │              │              │              │
+  │              │              │ Add Trace ID │              │              │              │              │              │              │
+  │              │              │ Routing      │              │              │              │              │              │              │
+  │              │              │─────────────>│              │              │              │              │              │              │
+  │              │              │              │ Idempotency  │              │              │              │              │              │
+  │              │              │              │ (Redis SETNX)│              │              │              │              │              │
+  │              │              │              │ Persist order│              │              │              │              │              │
+  │              │              │              │ (CREATED)    │              │              │              │              │              │
+  │              │              │              │              │              │              │              │              │              │
+  │              │              │              │ 1.Risk check │              │              │              │              │              │
+  │              │              │              │─────────────>│              │              │              │              │              │
+  │              │              │              │ PASS→PENDING │              │              │              │              │              │
+  │              │              │              │<─────────────│              │              │              │              │              │
+  │              │              │              │              │              │              │              │              │              │
+  │              │              │              │ 2.Start workflow payment-{id}              │              │              │              │
+  │              │              │              │────────────────────────────>│              │              │              │              │
+  │ 201 Created  │              │              │              │              │              │              │              │              │
+  │<───────────────────────────────────────────│              │              │              │              │              │              │
+  │              │              │              │              │              │              │              │              │              │
+  │              │              │              │              │              │ (async, Temporal activities)│              │              │
+  │              │              │              │ 3.markProcessing (PROCESSING)              │              │              │              │
+  │              │              │              │<────────────────────────────│              │              │              │              │
+  │              │              │              │              │              │ 4.freezeAmount              │              │              │
+  │              │              │              │              │              │─────────────>│              │              │              │
+  │              │              │              │              │              │ 5.createLedgerEntry         │              │              │
+  │              │              │              │              │              │────────────────────────────>│              │              │
+  │              │              │              │              │              │ 6.transfer   │              │              │              │
+  │              │              │              │              │              │─────────────>│              │              │              │
+  │              │              │              │ 7.markCompleted (COMPLETED) │              │              │              │              │
+  │              │              │              │<────────────────────────────│              │              │              │              │
+  │              │              │              │              │              │ 8.payment.completed         │              │              │
+  │              │              │              │              │              │───────────────────────────────────────────>│              │
+  │              │              │              │              │              │              │              │              │─────────────>│
+  │              │              │              │              │              │              │              │              │              │ 9.Webhook ──> callback
 ```
 
-**失败补偿（Saga）：** 若步骤 4/5 失败，按逆序补偿：reverseEntry → unfreezeAmount → 状态标记 FAILED → 发布 payment.failed。
+**Failure compensation (Saga):** `PaymentWorkflowImpl` uses Temporal's `Saga` class. Each forward step registers its exact inverse right after it succeeds, and on any failure in steps 3–7 (after Temporal retries are exhausted) the registered compensations run strictly in reverse order:
 
-### 4.1 支付状态机
+| Forward step | Compensation |
+|---|---|
+| `freezeAmount` (available → frozen) | `unfreezeAmount` (frozen → available) |
+| `createLedgerEntry` | `reverseLedgerEntry` — appends a `REVERSAL` entry with debit/credit swapped (ledger rows are never deleted) |
+| `transfer` (payer frozen → payee available) | `reverseTransfer` (payee available → payer frozen) |
+
+So a failure after the transfer runs `reverseTransfer → reverseLedgerEntry → unfreezeAmount`, then `markFailed` → publish `payment.failed`. Because `reverseTransfer` puts the funds back into the payer's *frozen* balance, the following `unfreezeAmount` always releases exactly this payment's funds.
+
+**No compensation after completion:** once `markCompleted` succeeds the payment is final. `sendCompletedNotification` runs outside the Saga, so a Kafka publish failure never reverses a completed payment.
+
+**At-most-once execution:** the workflow ID is `payment-{paymentId}`, and a duplicate request short-circuits in `IdempotencyStep` before the workflow is started. Activities are retried at-least-once, so the status activities (`markProcessing` / `markCompleted` / `markFailed`) are no-ops when the order is already in the target status.
+
+### 4.1 Payment State Machine
 
 ```
                 ┌──────────┐
                 │ CREATED  │
                 └────┬─────┘
-                     │ 风控通过
+                     │ risk check passed
                      ▼
-                ┌──────────┐    风控拒绝(sync)  ┌──────────┐
-                │ PENDING  │──────────────────>│ REJECTED │
-                └────┬─────┘                  └──────────┘
-      (CREATED也可→REJECTED)
-                     │ Kafka消费触发
+                ┌──────────┐  risk rejected (sync)  ┌──────────┐
+                │ PENDING  │───────────────────────>│ REJECTED │
+                └────┬─────┘                        └──────────┘
+      (CREATED can also → REJECTED)
+                     │ triggered by Kafka consumer
                      ▼
                 ┌──────────────┐
                 │ PROCESSING   │
                 └────┬────┬────┘
-          转账成功   │    │ 转账失败(+Saga补偿)
+  transfer succeeded │    │ transfer failed (+ Saga compensation)
                      ▼    ▼
             ┌───────────┐ ┌──────────┐
             │ COMPLETED │ │  FAILED  │
             └─────┬─────┘ └──────────┘
-                  │ 发起退款
+                  │ refund initiated
                   ▼
             ┌───────────┐
-            │ REFUNDED  │ (全额/部分, RefundStatus: PROCESSING→COMPLETED/FAILED)
+            │ REFUNDED  │ (full/partial, RefundStatus: PROCESSING→COMPLETED/FAILED)
             └───────────┘
 ```
 
 ---
 
-## 5. 高并发处理策略
+## 5. High-Concurrency Strategies
 
-### 5.1 幂等性控制
+### 5.1 Idempotency Control
 
 ```java
-// 基于 Redis 的幂等性控制
+// Redis-based idempotency control
 @Component
 public class IdempotencyFilter {
 
@@ -278,7 +344,7 @@ public class IdempotencyFilter {
     private RedisTemplate<String, String> redis;
 
     public boolean isDuplicate(String idempotencyKey) {
-        // SETNX: 只有 key 不存在时才设置成功, TTL 24h
+        // SETNX: only succeeds when the key does not exist, TTL 24h
         Boolean result = redis.opsForValue()
             .setIfAbsent("idempotent:" + idempotencyKey, "1", 24, TimeUnit.HOURS);
         return !Boolean.TRUE.equals(result);
@@ -286,20 +352,20 @@ public class IdempotencyFilter {
 }
 ```
 
-### 5.2 分布式锁（防止同一账户并发扣款）
+### 5.2 Distributed Locks (preventing concurrent debits on the same account)
 
 ```java
-// 基于 Redis + Redisson 的分布式锁
+// Distributed lock based on Redis + Redisson
 public PaymentResult processPayment(PaymentRequest req) {
     String lockKey = "account:lock:" + req.getFromAccount();
     RLock lock = redissonClient.getLock(lockKey);
 
     try {
-        // 等待 5 秒获取锁, 持有锁最多 30 秒(防止死锁)
+        // Wait up to 5s to acquire the lock, hold it for at most 30s (prevents deadlock)
         if (lock.tryLock(5, 30, TimeUnit.SECONDS)) {
             return doTransfer(req);
         } else {
-            throw new PaymentException("ACCOUNT_BUSY", "账户繁忙,请稍后重试");
+            throw new PaymentException("ACCOUNT_BUSY", "Account is busy, please retry later");
         }
     } finally {
         if (lock.isHeldByCurrentThread()) {
@@ -309,84 +375,136 @@ public PaymentResult processPayment(PaymentRequest req) {
 }
 ```
 
-### 5.3 限流策略
+### 5.3 Rate Limiting
 
-```nginx
-# frontend/nginx.conf — Nginx 漏桶算法
-limit_req_zone $binary_remote_addr zone=api_limit:10m rate=10r/s;
-
-# 应用于 /api/v1/payments 和 /api/v1/accounts
-limit_req zone=api_limit burst=20 nodelay;
-limit_req_status 429;
+```yaml
+# gateway-service/src/main/resources/application.yml — Redis token bucket algorithm
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 10      # Replenish 10 tokens per second
+            redis-rate-limiter.burstCapacity: 20      # Max burst of 20 tokens
+            redis-rate-limiter.requestedTokens: 1     # Each request consumes 1 token
+            key-resolver: "#{@ipKeyResolver}"         # Rate limit by client IP
 ```
 
-- **rate=10r/s**：每个客户端 IP 每秒最多 10 个请求
-- **burst=20**：允许瞬间突发 20 个请求，超出直接返回 429
-- **zone 10m**：共享内存 10MB，可追踪约 16 万个 IP
+- **replenishRate=10**: at most 10 requests per second per client IP
+- **burstCapacity=20**: allows an instantaneous burst of 20 requests; anything beyond returns 429
+- **ipKeyResolver**: resolves the client IP from `X-Forwarded-For` → `X-Real-IP` → remote address
+- Backed by Redis, so the limit is global across a distributed deployment
 
-### 5.4 数据库层优化
-
-```
-读写分离:
-├── Master: 写操作(支付、转账)
-├── Slave x2: 读操作(查询、对账)
-└── 连接池: HikariCP, maxPoolSize=50
-
-分库分表(当单表 > 5000万行):
-├── 按 account_id hash 分 16 个库
-├── 按 created_at 按月分表
-└── 使用 ShardingSphere 中间件
-
-热点账户处理:
-├── 异步记账: 先记流水, 定时汇总
-├── 内存记账: 热点账户余额缓存在 Redis
-└── 合并扣款: 批量处理同一账户的请求
-```
-
-### 5.5 异步化 + Temporal 工作流编排
+### 5.4 Database-Layer Optimization
 
 ```
-同步链路(用户等待): 风控检查 → 启动 Temporal Workflow → 返回 202
-异步链路(Temporal 编排):
-  markProcessing → freezeAmount → createLedgerEntry
-  → transfer → markCompleted → sendNotification
-  失败补偿: unfreezeAmount → markFailed → sendFailedNotification
+Read/write splitting:
+├── Master: writes (payments, transfers)
+├── Slave x2: reads (queries, reconciliation)
+└── Connection pool: HikariCP, maxPoolSize=50
 
-Temporal Workflow 配置:
-├── Task Queue: payment-workflow-queue
-├── Workflow ID: payment-{paymentId}  (确定性幂等)
-├── Activity 重试: maxAttempts=3, scheduleToCloseTimeout=30s
-└── Saga 补偿: 任意步骤失败 → 自动解冻资金
+Sharding (once a single table exceeds 50 million rows):
+├── Hash account_id into 16 databases
+├── Partition tables monthly by created_at
+└── Use ShardingSphere middleware
 
-Kafka Topic 设计:
-├── payment.completed   (Producer: payment-service)
-├── payment.failed      (Producer: payment-service)
+Hot account handling:
+├── Async bookkeeping: record journal entries first, aggregate on a schedule
+├── In-memory bookkeeping: cache hot account balances in Redis
+└── Merged debits: batch requests for the same account
+```
+
+### 5.5 Async + Temporal Workflow Orchestration
+
+```
+Sync path (user waits):   idempotency → persist order → risk check → start Temporal workflow → return 201
+Async path (Temporal):    markProcessing → freezeAmount → createLedgerEntry
+                          → transfer → markCompleted → sendCompletedNotification
+Saga compensation:        reverseTransfer → reverseLedgerEntry → unfreezeAmount
+                          → markFailed → sendFailedNotification
+
+Temporal workflow configuration:
+├── Task queue:        payment-workflow-queue
+├── Workflow ID:       payment-{paymentId}  (deterministic, at-most-once start)
+├── Activity retries:  maximumAttempts=3, startToCloseTimeout=30s
+└── Saga:              sequential compensation of every step that succeeded
+
+Kafka topic design (notifications only):
+├── payment.completed   (Producer: payment-service workflow activity)
+├── payment.failed      (Producer: payment-service workflow activity)
 └── notification.send   (Consumer: notification-service)
 
-注意: ledger.entry 和 risk.alert 在代码中并不存在。
-账务操作通过同步 Feign 调用 ledger-service 完成，非 Kafka。
+Note: ledger.entry and risk.alert do not exist in the code.
+Ledger operations go through synchronous Feign calls to ledger-service, not Kafka.
+Every event message carries an X-Trace-Id header when one is present in MDC.
 ```
+
+### 5.6 Optimistic Locking + Retry
+
+```java
+// AccountService: @Version optimistic lock + retry (up to 3 times, fresh transaction each time)
+public void transfer(String from, String to, Long amount) {
+    retryOnOptimisticLock(() -> transactionTemplate.executeWithoutResult(status -> {
+        Account fromAcc = getAccount(from);
+        Account toAcc   = getAccount(to);
+        fromAcc.debit(amount);
+        toAcc.credit(amount);
+        accountRepository.save(fromAcc);
+        accountRepository.save(toAcc);
+    }));
+}
+```
+
+- Both `Account` and `PaymentOrder` carry a `@Version` column
+- On conflict, `GlobalExceptionHandler` returns **409 Conflict**
+- ⚠️ **Do not initialize** the `@Version` field (leave it null); otherwise Spring Data treats the new entity as "already persisted", `save()` takes the `merge()` path, and a duplicate insert is triggered while the id is still null. The DB column already has `DEFAULT 0`.
+
+### 5.7 Feign 4xx Error Propagation
+
+```java
+// FallbackPolicy: 4xx business errors must be rethrown as-is, never disguised as SERVICE_UNAVAILABLE
+static void rethrowIfClientError(Throwable cause) {
+    if (cause instanceof FeignException fe && fe.status() >= 400 && fe.status() < 500) {
+        throw fe;
+    }
+}
+```
+
+`AccountClientFallbackFactory` / `LedgerClientFallbackFactory` call `FallbackPolicy.rethrowIfClientError()` before falling back: a 4xx means the upstream is reachable and returned a business error, so it should propagate directly; only 5xx / network errors / an open circuit take the `SERVICE_UNAVAILABLE` fallback. `RiskClientFallbackFactory` intentionally skips this handling (rejecting when risk control is unavailable is the safe policy).
+
+### 5.8 Distributed Tracing
+
+| Component | Implementation |
+|-----------|----------------|
+| Gateway | `TraceIdFilter` generates a UUID (if the inbound request has no `X-Trace-Id`) |
+| Java services | `TraceFilter` (servlet, `HIGHEST_PRECEDENCE`) writes to SLF4J MDC; `logback-spring.xml` renders `[traceId=...]` |
+| Java Feign outbound | `FeignTraceInterceptor` automatically copies it from MDC to the header |
+| Kafka | `PaymentEventProducer` writes it to the message header; the Go consumer reads it back |
+| Python (risk) | FastAPI `trace_middleware` propagates it and attaches it to logs |
+| Go (notification) | `extractTraceId(headers)` parses it from the Kafka header |
 
 ---
 
-## 6. 数据库设计
+## 6. Database Design
 
-### 核心表结构
+### Core Table Schemas
 
 ```sql
--- 支付订单表
+-- Payment order table
 CREATE TABLE payment_order (
     id              BIGSERIAL PRIMARY KEY,
-    payment_id      VARCHAR(64)  NOT NULL UNIQUE,    -- 业务主键
-    idempotency_key VARCHAR(64)  NOT NULL UNIQUE,    -- 幂等键
+    payment_id      VARCHAR(64)  NOT NULL UNIQUE,    -- Business key
+    idempotency_key VARCHAR(64)  NOT NULL UNIQUE,    -- Idempotency key
     from_account    VARCHAR(32)  NOT NULL,
     to_account      VARCHAR(32)  NOT NULL,
-    amount          BIGINT       NOT NULL,            -- 金额(分)
+    amount          BIGINT       NOT NULL,            -- Amount (cents)
     currency        VARCHAR(3)   NOT NULL DEFAULT 'CNY',
     status          VARCHAR(16)  NOT NULL DEFAULT 'CREATED',
     payment_method  VARCHAR(32)  NOT NULL,
     memo            VARCHAR(256),
     callback_url    VARCHAR(512),
+    version         BIGINT       NOT NULL DEFAULT 0,    -- Optimistic lock (006_add_payment_order_version.sql)
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ
@@ -394,27 +512,27 @@ CREATE TABLE payment_order (
 CREATE INDEX idx_payment_from_account ON payment_order(from_account, created_at);
 CREATE INDEX idx_payment_status ON payment_order(status);
 
--- 账户表
+-- Account table
 CREATE TABLE account (
     id                BIGSERIAL PRIMARY KEY,
     account_id        VARCHAR(32)  NOT NULL UNIQUE,
     account_name      VARCHAR(128) NOT NULL,
-    available_balance BIGINT       NOT NULL DEFAULT 0,  -- 可用余额(分)
-    frozen_balance    BIGINT       NOT NULL DEFAULT 0,  -- 冻结金额(分)
+    available_balance BIGINT       NOT NULL DEFAULT 0,  -- Available balance (cents)
+    frozen_balance    BIGINT       NOT NULL DEFAULT 0,  -- Frozen amount (cents)
     currency          VARCHAR(3)   NOT NULL DEFAULT 'CNY',
     status            VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
-    version           BIGINT       NOT NULL DEFAULT 0,  -- 乐观锁
+    version           BIGINT       NOT NULL DEFAULT 0,  -- Optimistic lock
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- 记账分录表 (复式记账)
+-- Ledger entry table (double-entry bookkeeping)
 CREATE TABLE ledger_entry (
     id              BIGSERIAL PRIMARY KEY,
     entry_id        VARCHAR(64)  NOT NULL UNIQUE,
     payment_id      VARCHAR(64)  NOT NULL,
-    debit_account   VARCHAR(32)  NOT NULL,    -- 借方账户
-    credit_account  VARCHAR(32)  NOT NULL,    -- 贷方账户
+    debit_account   VARCHAR(32)  NOT NULL,    -- Debit account
+    credit_account  VARCHAR(32)  NOT NULL,    -- Credit account
     amount          BIGINT       NOT NULL,
     currency        VARCHAR(3)   NOT NULL DEFAULT 'CNY',
     entry_type      VARCHAR(32)  NOT NULL,    -- PAYMENT / REFUND / FEE
@@ -423,7 +541,7 @@ CREATE TABLE ledger_entry (
 );
 CREATE INDEX idx_ledger_payment ON ledger_entry(payment_id);
 
--- 退款表
+-- Refund table
 CREATE TABLE refund_order (
     id              BIGSERIAL PRIMARY KEY,
     refund_id       VARCHAR(64)  NOT NULL UNIQUE,
@@ -434,72 +552,107 @@ CREATE TABLE refund_order (
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ
 );
+
+-- Audit log table (006_create_audit_log.sql)
+CREATE TABLE audit_log (
+    id              BIGSERIAL PRIMARY KEY,
+    trace_id        VARCHAR(64),                          -- Trace ID
+    service_name    VARCHAR(50)  NOT NULL,
+    action          VARCHAR(100) NOT NULL,                -- e.g. FREEZE_AMOUNT / TRANSFER / REVERSE_TRANSFER
+    resource_type   VARCHAR(50)  NOT NULL,                -- PAYMENT / REFUND / ACCOUNT
+    resource_id     VARCHAR(100),
+    detail          TEXT,
+    result          VARCHAR(20)  NOT NULL DEFAULT 'SUCCESS',  -- SUCCESS / FAILED / INFO
+    client_ip       VARCHAR(45),
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_audit_log_trace_id  ON audit_log(trace_id);
+CREATE INDEX idx_audit_log_resource  ON audit_log(resource_type, resource_id);
+CREATE INDEX idx_audit_log_action    ON audit_log(action);
+CREATE INDEX idx_audit_log_created_at ON audit_log(created_at);
 ```
 
 ---
 
-## 7. Code Structure (项目代码结构)
+## 7. Code Structure
 
 ```
 payflow-engine/
 │
 ├── README.md
-├── CLAUDE.md                       # AI 助手指南
-├── docker-compose.yml              # 全栈本地编排
+├── CLAUDE.md                       # AI assistant guide
+├── docker-compose.yml              # Full-stack local orchestration
 │
-├── frontend/                       # 前端 (React + TypeScript + Ant Design)
-│   ├── nginx.conf                  # 静态托管 + 反向代理 + IP 限流
+├── gateway-service/                # API gateway (Java Spring Cloud Gateway)
+│   ├── pom.xml
+│   ├── Dockerfile
+│   └── src/main/java/com/payflow/gateway/
+│       ├── GatewayApplication.java
+│       ├── config/
+│       │   ├── JwtProperties.java              # JWT config properties (secret, enabled)
+│       │   └── RateLimiterConfig.java           # IP rate-limit KeyResolver
+│       └── filter/
+│           ├── AuthenticationFilter.java        # JWT authentication filter (order -2)
+│           ├── TraceIdFilter.java               # Tracing via X-Trace-Id (order -3)
+│           └── RequestLoggingFilter.java        # Request logging (order -1)
+│   └── src/main/resources/
+│       └── application.yml                      # Routes, rate limiting, JWT config
+│
+├── frontend/                       # Frontend (React + TypeScript + Ant Design)
+│   ├── nginx.conf                  # Static hosting + reverse proxy to Gateway Service
 │   ├── Dockerfile
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── vite.config.ts
 │   ├── index.html
 │   └── src/
-│       ├── main.tsx                            # 入口
-│       ├── App.tsx                             # 路由配置
+│       ├── main.tsx                            # Entry point
+│       ├── App.tsx                             # Route configuration
 │       ├── layouts/
-│       │   └── MainLayout.tsx                  # 侧边栏布局
+│       │   └── MainLayout.tsx                  # Sidebar layout
 │       ├── pages/
-│       │   ├── PaymentListPage.tsx             # 支付列表(分页/筛选)
-│       │   ├── PaymentCreatePage.tsx           # 发起支付表单
-│       │   ├── PaymentDetailPage.tsx           # 支付详情 + 退款
-│       │   └── AccountPage.tsx                 # 账户余额查询
+│       │   ├── PaymentListPage.tsx             # Payment list (pagination/filtering)
+│       │   ├── PaymentCreatePage.tsx           # Create-payment form
+│       │   ├── PaymentDetailPage.tsx           # Payment detail + refund
+│       │   ├── AccountPage.tsx                 # Account balance lookup
+│       │   └── AuditPage.tsx                   # Audit log list + trace timeline
 │       ├── api/
-│       │   ├── client.ts                       # Axios 实例(拦截器)
-│       │   ├── payment.ts                      # 支付 API 封装
-│       │   └── account.ts                      # 账户 API 封装
+│       │   ├── client.ts                       # Axios instance (interceptors)
+│       │   ├── payment.ts                      # Payment API wrapper
+│       │   ├── account.ts                      # Account API wrapper
+│       │   └── audit.ts                        # Audit API wrapper
 │       ├── types/
-│       │   └── index.ts                        # TypeScript 类型定义
+│       │   └── index.ts                        # TypeScript type definitions
 │       ├── utils/
-│       │   └── format.ts                       # 金额/时间格式化
+│       │   └── format.ts                       # Amount/time formatting
 │       └── styles/
 │           └── global.css
 │
-├── payment-service/                # 支付核心服务 (Java Spring Boot)
+├── payment-service/                # Core payment service (Java Spring Boot)
 │   ├── pom.xml
 │   ├── Dockerfile
 │   └── src/main/java/com/payflow/payment/
 │       ├── PaymentApplication.java
 │       ├── controller/
-│       │   └── PaymentController.java          # REST API 入口 (含 request record DTOs)
+│       │   └── PaymentController.java          # REST API entry point (incl. request record DTOs)
 │       ├── service/
-│       │   ├── PaymentService.java             # 启动 Temporal Workflow
-│       │   ├── RefundService.java              # 退款逻辑
+│       │   ├── PaymentService.java             # Payment creation (delegates to pipeline) + queries
+│       │   ├── RefundService.java              # Refund logic
 │       │   └── pipeline/
-│       │       ├── PaymentCreationPipeline.java # 流水线编排器
-│       │       ├── PaymentCreationContext.java  # 流水线上下文(含 shortCircuit)
-│       │       ├── PaymentCreationStep.java     # Step 接口
+│       │       ├── PaymentCreationPipeline.java # Pipeline orchestrator
+│       │       ├── PaymentCreationContext.java  # Pipeline context (incl. shortCircuit)
+│       │       ├── PaymentCreationStep.java     # Step interface
 │       │       └── step/
-│       │           ├── IdempotencyStep.java     # Step1: 幂等占位
-│       │           ├── OrderPersistStep.java    # Step2: 订单持久化
-│       │           ├── RiskCheckStep.java       # Step3: 风控检查
-│       │           └── EventPublishStep.java    # Step4: 事件发布
+│       │           ├── IdempotencyStep.java     # Step 1: idempotency reservation
+│       │           ├── OrderPersistStep.java    # Step 2: order persistence
+│       │           ├── RiskCheckStep.java       # Step 3: risk check
+│       │           └── WorkflowStartStep.java   # Step 4: start Temporal workflow
 │       ├── workflow/
-│       │   ├── PaymentWorkflow.java            # Workflow 接口
-│       │   ├── PaymentWorkflowImpl.java        # Workflow 实现 (Saga 编排)
-│       │   ├── PaymentActivities.java          # Activity 接口 (9个步骤)
-│       │   ├── PaymentActivitiesImpl.java      # Activity 实现 (Feign + Kafka)
-│       │   └── PaymentWorkflowInput.java       # Workflow 输入 DTO
+│       │   ├── PaymentWorkflow.java            # Workflow interface
+│       │   ├── PaymentWorkflowImpl.java        # Workflow implementation (Saga orchestration)
+│       │   ├── PaymentActivities.java          # Activity interface (forward steps + compensations)
+│       │   ├── PaymentActivitiesImpl.java      # Activity implementations (Feign + Kafka + audit)
+│       │   └── PaymentWorkflowInput.java       # Workflow input DTO
 │       ├── dto/
 │       │   ├── CreatePaymentResponse.java
 │       │   ├── PaymentResponse.java
@@ -507,46 +660,65 @@ payflow-engine/
 │       │   ├── RefundResponse.java
 │       │   └── RefundDetailResponse.java
 │       ├── domain/
-│       │   ├── PaymentOrder.java               # 支付订单实体
-│       │   ├── PaymentStatus.java              # 状态枚举(含状态机 canTransitTo)
-│       │   ├── RefundOrder.java                # 退款实体
-│       │   └── RefundStatus.java               # 退款状态枚举(PROCESSING/COMPLETED/FAILED)
+│       │   ├── PaymentOrder.java               # Payment order entity
+│       │   ├── PaymentStatus.java              # Status enum (incl. state machine canTransitTo)
+│       │   ├── RefundOrder.java                # Refund entity
+│       │   └── RefundStatus.java               # Refund status enum (PROCESSING/COMPLETED/FAILED)
 │       ├── repository/
 │       │   ├── PaymentOrderRepository.java
 │       │   └── RefundOrderRepository.java
 │       ├── client/
 │       │   ├── AccountClient.java              # Feign → account-service
-│       │   ├── AccountClientFallbackFactory.java # 熔断降级
+│       │   ├── AccountClientFallbackFactory.java # Circuit-breaker fallback (4xx propagated)
 │       │   ├── RiskClient.java                 # Feign → risk-service
-│       │   ├── RiskClientFallbackFactory.java  # 熔断降级
+│       │   ├── RiskClientFallbackFactory.java  # Circuit-breaker fallback (rejects on any error, safe policy)
 │       │   ├── LedgerClient.java               # Feign → ledger-service
-│       │   └── LedgerClientFallbackFactory.java # 熔断降级
+│       │   ├── LedgerClientFallbackFactory.java # Circuit-breaker fallback (4xx propagated)
+│       │   └── FallbackPolicy.java             # rethrowIfClientError (4xx never disguised as SERVICE_UNAVAILABLE)
+│       ├── audit/                              # Audit module
+│       │   ├── AuditLog.java                   # Audit entity
+│       │   ├── AuditLogRepository.java
+│       │   ├── AuditService.java               # @Async writes, captures traceId automatically
+│       │   └── AuditController.java            # /api/v1/audit/{logs|trace|resource}
 │       ├── mq/
-│       │   └── PaymentEventProducer.java       # Kafka 生产者(通知广播)
+│       │   ├── PaymentEventProducer.java       # Kafka producer for notifications (writes the X-Trace-Id header)
+│       │   └── PaymentEventConsumer.java       # Deprecated stub — payment.created processing moved to Temporal
 │       ├── config/
-│       │   ├── IdempotencyFilter.java          # 幂等性拦截器(Redis SETNX)
-│       │   ├── KafkaConfig.java                # Kafka 配置
-│       │   ├── WebConfig.java                  # Web 配置
-│       │   └── TemporalConfig.java             # Temporal Worker + WorkflowClient
+│       │   ├── IdempotencyFilter.java          # Idempotency interceptor (Redis SETNX)
+│       │   ├── KafkaConfig.java                # Kafka config
+│       │   ├── WebConfig.java                  # Web config
+│       │   ├── TraceFilter.java                # Inbound X-Trace-Id → MDC
+│       │   ├── FeignTraceInterceptor.java      # Injects traceId into outbound Feign calls
+│       │   └── TemporalConfig.java             # Temporal WorkflowClient + worker registration
 │       └── exception/
 │           ├── PaymentException.java
-│           └── GlobalExceptionHandler.java
+│           └── GlobalExceptionHandler.java     # Incl. OptimisticLockException → 409
+│   └── src/main/resources/
+│       ├── application.yml                    # Resilience4j + Actuator
+│       └── logback-spring.xml                 # [traceId=...] log pattern
 │
-├── account-service/                # 账户服务 (Java Spring Boot)
+├── account-service/                # Account service (Java Spring Boot)
 │   ├── pom.xml
 │   ├── Dockerfile
 │   └── src/main/java/com/payflow/account/
 │       ├── AccountApplication.java
 │       ├── controller/
-│       │   └── AccountController.java          # freeze / unfreeze / transfer / balance
+│       │   └── AccountController.java          # freeze / unfreeze / transfer / reverse-transfer / balance
 │       ├── service/
-│       │   └── AccountService.java             # 余额操作、冻结解冻、分布式锁
+│       │   └── AccountService.java             # TransactionTemplate + optimistic-lock retry (3 attempts)
 │       ├── domain/
-│       │   └── Account.java                    # @Version 乐观锁
-│       └── repository/
-│           └── AccountRepository.java
+│       │   └── Account.java                    # @Version optimistic lock
+│       ├── config/
+│       │   └── TraceFilter.java                # Inbound X-Trace-Id → MDC
+│       ├── repository/
+│       │   └── AccountRepository.java
+│       └── exception/
+│           └── GlobalExceptionHandler.java     # OptimisticLockException → 409
+│   └── src/main/resources/
+│       ├── application.yml
+│       └── logback-spring.xml
 │
-├── ledger-service/                 # 记账服务 (Java Spring Boot)
+├── ledger-service/                 # Ledger service (Java Spring Boot)
 │   ├── pom.xml
 │   ├── Dockerfile
 │   └── src/main/java/com/payflow/ledger/
@@ -554,134 +726,142 @@ payflow-engine/
 │       ├── controller/
 │       │   └── LedgerController.java
 │       ├── service/
-│       │   └── LedgerService.java              # 复式记账逻辑
+│       │   └── LedgerService.java              # Double-entry bookkeeping logic
 │       ├── domain/
 │       │   └── LedgerEntry.java
+│       ├── config/
+│       │   └── TraceFilter.java                # Inbound X-Trace-Id → MDC
 │       └── repository/
 │           └── LedgerEntryRepository.java
+│   └── src/main/resources/
+│       ├── application.yml
+│       └── logback-spring.xml
 │
-├── risk-service/                   # 风控服务 (Python FastAPI)
+├── risk-service/                   # Risk service (Python FastAPI)
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── main.py                                 # FastAPI 入口
+│   ├── main.py                                 # FastAPI entry point + trace_middleware
 │   └── rules/
-│       ├── rule_engine.py                      # 责任链编排
-│       ├── blacklist.py                        # 黑名单检查
-│       └── amount_limit.py                     # 限额规则
+│       ├── rule_engine.py                      # Chain-of-responsibility orchestration
+│       ├── blacklist.py                        # Blacklist check
+│       └── amount_limit.py                     # Amount limit rule
 │
-├── notification-service/           # 通知服务 (Go)
+├── notification-service/           # Notification service (Go)
 │   ├── Dockerfile
 │   ├── go.mod
 │   ├── main.go
 │   ├── handler/
-│   │   └── webhook.go                          # Webhook 回调
+│   │   └── webhook.go                          # Webhook callback
 │   └── consumer/
-│       └── kafka_consumer.go                   # 消费 Kafka 事件
+│       └── kafka_consumer.go                   # Consumes Kafka events (extractTraceId)
 │
-└── sql/                            # 数据库初始化脚本(容器启动时自动执行)
+└── sql/                            # Database init scripts (run in lexical order at container startup)
     ├── 001_create_payment_order.sql
     ├── 002_create_account.sql
     ├── 003_create_ledger_entry.sql
     ├── 004_create_refund_order.sql
-    └── 005_seed_accounts.sql       # 测试账户种子数据 (acc001-acc004)
+    ├── 005_seed_accounts.sql       # Test account seed data (acc001-acc004)
+    ├── 006_add_payment_order_version.sql  # PaymentOrder.version column (optimistic lock)
+    └── 006_create_audit_log.sql           # Audit log table
 ```
 
 ---
 
-## 8. 关键设计决策
+## 8. Key Design Decisions
 
-### 8.1 为什么用复式记账?
+### 8.1 Why double-entry bookkeeping?
 
-银行系统的核心是**钱不能多也不能少**。复式记账确保每笔交易都有借方和贷方，金额必须相等：
-
-```
-付款方(借) 10000  ──>  收款方(贷) 10000
-```
-
-任何时刻 `SUM(debit) == SUM(credit)`，否则系统报警。
-
-### 8.2 为什么先冻结再转账?
+The core rule of a banking system is that **money can neither appear nor disappear**. Double-entry bookkeeping guarantees every transaction has a debit side and a credit side, and the amounts must be equal:
 
 ```
-冻结模式: 可用余额 ─(冻结)─> 冻结余额 ─(确认)─> 对方可用余额
-直接扣款: 可用余额 ─(扣款)─> 对方可用余额 (失败时难以回滚)
+Payer (debit) 10000  ──>  Payee (credit) 10000
 ```
 
-冻结模式提供了**两阶段提交**的语义，即使下游失败也能安全解冻回滚。
+At any moment `SUM(debit) == SUM(credit)`; otherwise the system raises an alarm.
 
-### 8.3 金额为什么用 BIGINT(分)?
-
-- 浮点数有精度问题: `0.1 + 0.2 ≠ 0.3`
-- 用最小货币单位(分)的整数表示，完全避免精度丢失
-- 展示层再除以 100 转为元
-
-### 8.5 为什么用 Temporal 替代 Kafka 编舞?
-
-原来的架构通过 Kafka 事件编舞（choreography）协调各服务，存在以下问题：
-- 流程分散在多个消费者中，难以追踪全局状态
-- 补偿逻辑（失败回滚）需要手动实现并维护
-
-Temporal **工作流编排（orchestration）** 的优势：
-```
-可见性:   Temporal UI 实时展示每一步活动状态和执行历史
-可靠性:   内置重试、超时、幂等 (Workflow ID = payment-{id})
-补偿:     Saga 模式 — 失败时自动触发 unfreezeAmount 补偿活动
-持久性:   Workflow 状态持久化，服务重启后自动续跑
-```
-
-Kafka 保留用于最终通知广播（notification.send），这是 pub/sub 的自然场景。
-
-### 8.4 高可用保障
+### 8.2 Why freeze before transferring?
 
 ```
-┌─────────────────────────────────────────┐
-│           高可用策略                      │
-├─────────────────────────────────────────┤
-│ 服务层: K8s 多副本 + HPA 自动扩缩容       │
-│ 数据层: PG 主从 + 自动 failover           │
-│ 缓存层: Redis Cluster 6 节点             │
-│ 消息层: Kafka 3 Broker, 副本因子=3       │
-│ 网关层: Nginx 多实例 + Keepalived VIP    │
-│ 容灾:  多 AZ 部署, RPO=0, RTO<30s       │
-└─────────────────────────────────────────┘
+Freeze model:  available balance ─(freeze)─> frozen balance ─(confirm)─> payee's available balance
+Direct debit:  available balance ─(debit)─> payee's available balance (hard to roll back on failure)
 ```
+
+The freeze model provides **two-phase commit** semantics: even if a downstream step fails, the funds can be safely unfrozen and rolled back.
+
+### 8.3 Why store amounts as BIGINT (cents)?
+
+- Floating-point numbers have precision problems: `0.1 + 0.2 ≠ 0.3`
+- Representing amounts as integers in the smallest currency unit (cents) avoids precision loss entirely
+- The presentation layer divides by 100 to convert to yuan
+
+### 8.4 High-Availability Guarantees
+
+```
+┌──────────────────────────────────────────────────────────┐
+│               High-Availability Strategy                 │
+├──────────────────────────────────────────────────────────┤
+│ Service layer: K8s multi-replica + HPA autoscaling       │
+│ Data layer:    PG primary/replica + automatic failover   │
+│ Cache layer:   Redis Cluster, 6 nodes                    │
+│ Message layer: Kafka 3 brokers, replication factor = 3   │
+│ Gateway layer: Nginx multi-instance + Keepalived VIP     │
+│ DR:            multi-AZ deployment, RPO=0, RTO<30s       │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 8.5 Why Temporal instead of Kafka choreography?
+
+The earlier architecture coordinated fulfillment through Kafka event choreography (`payment.created` → consumer → hand-written try/catch with boolean flags). That approach had several problems:
+- The flow was spread across consumers, making the global state hard to trace
+- Process state was lost on a crash, with no way to resume from the last completed step
+- Retries and compensation (rollback) had to be implemented and maintained by hand
+
+Temporal **workflow orchestration** solves these:
+```
+Visibility:   Temporal UI shows every activity's status and full execution history
+Reliability:  built-in retries, timeouts, and deduplication (workflow ID = payment-{id})
+Compensation: Saga pattern — every forward step registers its exact inverse
+Durability:   workflow state is persisted, so execution resumes after a service restart
+```
+
+Kafka is kept for the final notification broadcast (`payment.completed` / `payment.failed` / `notification.send`), which is a natural pub/sub use case.
 
 ---
 
-## 9. 本地启动指南
+## 9. Local Setup Guide
 
-### 9.1 环境要求
+### 9.1 Prerequisites
 
-| 工具 | 最低版本 | 用途 |
-|------|---------|------|
-| Docker & Docker Compose | 24+ / 2.20+ | 基础设施 (PG, Redis, Kafka) |
-| Java (JDK) | 21+ | payment / account / ledger 服务 |
-| Maven | 3.9+ | Java 项目构建 |
-| Node.js | 20+ | 前端构建 |
-| Python | 3.12+ | 风控服务 |
-| Go | 1.22+ | 通知服务 |
+| Tool | Minimum Version | Purpose |
+|------|-----------------|---------|
+| Docker & Docker Compose | 24+ / 2.20+ | Infrastructure (PG, Redis, Kafka) |
+| Java (JDK) | 21+ | payment / account / ledger services |
+| Maven | 3.9+ | Java project builds |
+| Node.js | 20+ | Frontend build |
+| Python | 3.12+ | Risk service |
+| Go | 1.22+ | Notification service |
 
-### 9.2 一键启动（推荐）
+### 9.2 Quick Start (recommended)
 
 ```bash
-# 1. 克隆项目
+# 1. Clone the project
 git clone https://github.com/larryaus/payflow-engine.git
 cd payflow-engine
 
-# 2. 启动基础设施 (PostgreSQL + Redis + Kafka + Temporal)
+# 2. Start the infrastructure (PostgreSQL + Redis + Kafka + Temporal)
 docker-compose up -d postgres redis kafka temporal temporal-ui
 
-# 3. 等待基础设施就绪 (约 10-15 秒)
+# 3. Wait for the infrastructure to be ready (about 10-15 seconds)
 echo "Waiting for infrastructure..."
 sleep 15
 
-# 4. 验证基础设施状态
+# 4. Verify the infrastructure status
 docker-compose ps
 ```
 
-### 9.3 逐个启动各服务
+### 9.3 Starting Each Service Individually
 
-#### 终端 1 — 风控服务 (Python)
+#### Terminal 1 — Risk Service (Python)
 
 ```bash
 cd risk-service
@@ -691,39 +871,48 @@ pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8084 --reload
 ```
 
-验证: `curl http://localhost:8084/health`
+Verify: `curl http://localhost:8084/health`
 
-#### 终端 2 — 账户服务 (Java)
+#### Terminal 2 — Account Service (Java)
 
 ```bash
 cd account-service
 mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8082"
 ```
 
-#### 终端 3 — 记账服务 (Java)
+#### Terminal 3 — Ledger Service (Java)
 
 ```bash
 cd ledger-service
 mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8083"
 ```
 
-#### 终端 4 — 支付服务 (Java)
+#### Terminal 4 — Payment Service (Java)
 
 ```bash
 cd payment-service
 mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8081"
 ```
 
-#### 终端 5 — 通知服务 (Go)
+#### Terminal 5 — Notification Service (Go)
 
 ```bash
 cd notification-service
 go run main.go
 ```
 
-验证: `curl http://localhost:8085/health`
+Verify: `curl http://localhost:8085/health`
 
-#### 终端 6 — 前端
+#### Terminal 6 — API Gateway (Java)
+
+```bash
+cd gateway-service
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8080"
+```
+
+Verify: `curl http://localhost:8080/actuator/health`
+
+#### Terminal 7 — Frontend
 
 ```bash
 cd frontend
@@ -731,59 +920,60 @@ npm install
 npm run dev
 ```
 
-打开浏览器访问: **http://localhost:3000**
+Open in your browser: **http://localhost:3000**
 
-### 9.4 使用 Docker Compose 全量启动
+### 9.4 Starting Everything with Docker Compose
 
 ```bash
-# 一键启动所有服务 + 基础设施
+# Start all services + infrastructure in one command
 docker-compose up -d
 
-# 查看所有服务状态
+# Show the status of all services
 docker-compose ps
 
-# 查看某个服务日志
+# Tail the logs of a single service
 docker-compose logs -f payment-service
 
-# 停止所有服务
+# Stop all services
 docker-compose down
 
-# 停止并清除数据卷 (完全重置)
+# Stop and remove data volumes (full reset)
 docker-compose down -v
 ```
 
-### 9.5 服务端口总览
+### 9.5 Service Port Overview
 
-启动完成后，各服务端口如下:
+Once everything is up, the services listen on the following ports:
 
 ```
 ┌──────────────────────────────────┬────────┬──────────────────────────┐
-│ 服务                              │ 端口   │ 地址                      │
+│ Service                          │ Port   │ Address                  │
 ├──────────────────────────────────┼────────┼──────────────────────────┤
-│ Frontend (Nginx + React SPA)     │ 3000   │ http://localhost:3000     │
-│ Payment Service                  │ 8081   │ http://localhost:8081     │
-│ Account Service                  │ 8082   │ http://localhost:8082     │
-│ Ledger Service                   │ 8083   │ http://localhost:8083     │
-│ Risk Service                     │ 8084   │ http://localhost:8084     │
-│ Notification Service             │ 8085   │ http://localhost:8085     │
-│ Temporal UI                      │ 8088   │ http://localhost:8088     │
+│ Frontend (Nginx + React SPA)     │ 3000   │ http://localhost:3000    │
+│ Gateway Service (API gateway)    │ 8080   │ http://localhost:8080    │
+│ Payment Service                  │ 8081   │ http://localhost:8081    │
+│ Account Service                  │ 8082   │ http://localhost:8082    │
+│ Ledger Service                   │ 8083   │ http://localhost:8083    │
+│ Risk Service                     │ 8084   │ http://localhost:8084    │
+│ Notification Service             │ 8085   │ http://localhost:8085    │
+│ Temporal UI                      │ 8088   │ http://localhost:8088    │
 ├──────────────────────────────────┼────────┼──────────────────────────┤
-│ PostgreSQL                       │ 5432   │ localhost:5432            │
-│ Redis                            │ 6379   │ localhost:6379            │
-│ Kafka                            │ 9092   │ localhost:9092            │
-│ Temporal Server                  │ 7233   │ localhost:7233            │
+│ PostgreSQL                       │ 5432   │ localhost:5432           │
+│ Redis                            │ 6379   │ localhost:6379           │
+│ Kafka                            │ 9092   │ localhost:9092           │
+│ Temporal Server                  │ 7233   │ localhost:7233           │
 └──────────────────────────────────┴────────┴──────────────────────────┘
 ```
 
-### 9.6 快速验证
+### 9.6 Quick Verification
 
 ```bash
-# 1. 健康检查
+# 1. Health checks
 curl http://localhost:8084/health        # Risk Service
 curl http://localhost:8085/health        # Notification Service
 
-# 2. 创建支付订单
-curl -X POST http://localhost:8081/api/v1/payments \
+# 2. Create a payment order through the gateway (JWT_ENABLED=false by default, no Authorization needed)
+curl -X POST http://localhost:8080/api/v1/payments \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{
@@ -792,48 +982,54 @@ curl -X POST http://localhost:8081/api/v1/payments \
     "amount": 10000,
     "currency": "CNY",
     "payment_method": "BANK_TRANSFER",
-    "memo": "测试支付"
+    "memo": "Test payment"
   }'
 
-# 3. 查询支付状态
-curl http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX
+# 3. Get the payment status
+curl http://localhost:8080/api/v1/payments/PAY_XXXXXXXX_XXXXXX
 
-# 4. 查询账户列表
-curl http://localhost:8082/api/v1/accounts
+# 4. List accounts
+curl http://localhost:8080/api/v1/accounts
 
-# 5. 查询账户余额
-curl http://localhost:8082/api/v1/accounts/ACC_001/balance
+# 5. Get an account balance
+curl http://localhost:8080/api/v1/accounts/ACC_001/balance
 
-# 5. 发起退款
-curl -X POST http://localhost:8081/api/v1/payments/PAY_XXXXXXXX_XXXXXX/refund \
+# 6. Initiate a refund
+curl -X POST http://localhost:8080/api/v1/payments/PAY_XXXXXXXX_XXXXXX/refund \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{
     "amount": 5000,
-    "reason": "测试退款"
+    "reason": "Test refund"
   }'
+
+# 7. Look up the end-to-end audit trail by trace ID
+TRACE_ID=$(curl -sI http://localhost:8080/api/v1/accounts | awk '/X-Trace-Id/ {print $2}' | tr -d '\r')
+curl http://localhost:8080/api/v1/audit/trace/$TRACE_ID
+
+# Tip: to enable JWT on the gateway, set JWT_ENABLED=true and add Authorization: Bearer <token> to requests
 ```
 
-### 9.7 数据库连接
+### 9.7 Database Connections
 
 ```bash
-# 连接 PostgreSQL
+# Connect to PostgreSQL
 psql -h localhost -U payflow -d payflow
-# 密码: payflow_secret
+# Password: payflow_secret
 
-# 查看已创建的表
+# List the created tables
 \dt
 
-# 连接 Redis
+# Connect to Redis
 redis-cli -h localhost -p 6379
 ```
 
-### 9.8 常见问题
+### 9.8 Troubleshooting
 
-| 问题 | 解决方案 |
-|------|---------|
-| 端口被占用 | `lsof -i :PORT` 找到进程并 kill，或修改配置中的端口 |
-| Kafka 启动失败 | 确保 Docker 分配了足够内存 (建议 >= 4GB) |
-| Java 服务连不上 PG | 确认 PostgreSQL 已完全启动: `docker-compose logs postgres` |
-| 前端 API 请求 404 | 确认 vite proxy 指向正确的网关端口，或直连后端服务 |
-| Maven 下载慢 | 配置 `~/.m2/settings.xml` 使用阿里云镜像源 |
+| Problem | Solution |
+|---------|----------|
+| Port already in use | Run `lsof -i :PORT` to find the process and kill it, or change the port in the config |
+| Kafka fails to start | Make sure Docker has enough memory allocated (>= 4GB recommended) |
+| Java services can't connect to PG | Confirm PostgreSQL has fully started: `docker-compose logs postgres` |
+| Frontend API requests return 404 | Confirm the Vite proxy points to Gateway Service (8080), or call the backend services directly |
+| Slow Maven downloads | Configure `~/.m2/settings.xml` to use a closer mirror (e.g. the Aliyun mirror) |

@@ -21,6 +21,7 @@ jobs:
       matrix:
         service:
           - frontend
+          - gateway-service
           - payment-service
           - account-service
           - ledger-service

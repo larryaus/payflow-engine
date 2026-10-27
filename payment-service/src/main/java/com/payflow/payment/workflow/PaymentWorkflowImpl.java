@@ -33,8 +33,8 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
             activities.markProcessing(paymentId);
 
             // 2. 冻结付款方金额
-            activities.freezeAmount(input.getFromAccount(), input.getAmount());
-            saga.addCompensation(() -> activities.unfreezeAmount(input.getFromAccount(), input.getAmount()));
+            activities.freezeAmount(paymentId, input.getFromAccount(), input.getAmount());
+            saga.addCompensation(() -> activities.unfreezeAmount(paymentId, input.getFromAccount(), input.getAmount()));
 
             // 3. 创建复式记账分录
             activities.createLedgerEntry(
@@ -47,11 +47,13 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
 
             // 4. 解冻并执行转账
             activities.transfer(
+                    paymentId,
                     input.getFromAccount(),
                     input.getToAccount(),
                     input.getAmount()
             );
             saga.addCompensation(() -> activities.reverseTransfer(
+                    paymentId,
                     input.getFromAccount(),
                     input.getToAccount(),
                     input.getAmount()
@@ -60,16 +62,17 @@ public class PaymentWorkflowImpl implements PaymentWorkflow {
             // 5. 标记完成
             activities.markCompleted(paymentId);
 
-            // 6. 发送完成通知
-            activities.sendCompletedNotification(paymentId);
-
-            log.info("Payment workflow completed for {}", paymentId);
-
         } catch (Exception e) {
             log.error("Payment workflow failed for {}: {}, starting compensation", paymentId, e.getMessage());
             saga.compensate();
             activities.markFailed(paymentId, e.getMessage());
             activities.sendFailedNotification(paymentId, e.getMessage());
+            return;
         }
+
+        // 6. 发送完成通知 — 订单已 COMPLETED，通知失败不得触发 Saga 补偿
+        activities.sendCompletedNotification(paymentId);
+
+        log.info("Payment workflow completed for {}", paymentId);
     }
 }

@@ -2,10 +2,10 @@ package com.payflow.payment.service.pipeline;
 
 import com.payflow.payment.controller.PaymentController.CreatePaymentRequest;
 import com.payflow.payment.domain.PaymentOrder;
-import com.payflow.payment.service.pipeline.step.EventPublishStep;
 import com.payflow.payment.service.pipeline.step.IdempotencyStep;
 import com.payflow.payment.service.pipeline.step.OrderPersistStep;
 import com.payflow.payment.service.pipeline.step.RiskCheckStep;
+import com.payflow.payment.service.pipeline.step.WorkflowStartStep;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -17,7 +17,7 @@ import java.util.List;
  *   IdempotencyStep  → 幂等占位 / 重复请求短路返回
  *   OrderPersistStep → 构建并持久化订单
  *   RiskCheckStep    → 风控审核，拒绝则抛出异常
- *   EventPublishStep → 发布 payment.created 事件，触发异步处理
+ *   WorkflowStartStep → 启动 Temporal Workflow，异步执行冻结→记账→转账
  *
  * 任意 Step 将 ctx.shortCircuit() 置为 true 后，后续 Step 均跳过。
  */
@@ -30,8 +30,8 @@ public class PaymentCreationPipeline {
             IdempotencyStep idempotencyStep,
             OrderPersistStep orderPersistStep,
             RiskCheckStep riskCheckStep,
-            EventPublishStep eventPublishStep) {
-        this.steps = List.of(idempotencyStep, orderPersistStep, riskCheckStep, eventPublishStep);
+            WorkflowStartStep workflowStartStep) {
+        this.steps = List.of(idempotencyStep, orderPersistStep, riskCheckStep, workflowStartStep);
     }
 
     public PaymentOrder execute(String idempotencyKey, CreatePaymentRequest request) {

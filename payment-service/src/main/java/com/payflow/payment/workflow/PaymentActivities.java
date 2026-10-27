@@ -7,10 +7,10 @@ import io.temporal.activity.ActivityMethod;
 public interface PaymentActivities {
 
     @ActivityMethod
-    void freezeAmount(String accountId, Long amount);
+    void freezeAmount(String paymentId, String accountId, Long amount);
 
     @ActivityMethod
-    void unfreezeAmount(String accountId, Long amount);
+    void unfreezeAmount(String paymentId, String accountId, Long amount);
 
     @ActivityMethod
     void createLedgerEntry(String paymentId, String fromAccount, String toAccount, Long amount);
@@ -19,10 +19,10 @@ public interface PaymentActivities {
     void reverseLedgerEntry(String paymentId);
 
     @ActivityMethod
-    void transfer(String fromAccount, String toAccount, Long amount);
+    void transfer(String paymentId, String fromAccount, String toAccount, Long amount);
 
     @ActivityMethod
-    void reverseTransfer(String fromAccount, String toAccount, Long amount);
+    void reverseTransfer(String paymentId, String fromAccount, String toAccount, Long amount);
 
     @ActivityMethod
     void markProcessing(String paymentId);

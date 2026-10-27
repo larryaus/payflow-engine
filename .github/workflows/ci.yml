@@ -99,6 +99,24 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m py_compile main.py
 
+  # ==================== Gateway Service ====================
+  gateway-service:
+    name: Gateway Service (Build & Test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gateway-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: temurin
+          cache: maven
+
+      - run: mvn -B clean verify
+
   # ==================== Notification Service ====================
   notification-service:
     name: Notification Service (Build)
