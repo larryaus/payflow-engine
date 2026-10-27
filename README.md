@@ -984,3 +984,31 @@ redis-cli -h localhost -p 6379
 | Java services can't connect to PG | Confirm PostgreSQL has fully started: `docker-compose logs postgres` |
 | Frontend API requests return 404 | Confirm the Vite proxy points to Gateway Service (8080), or call the backend services directly |
 | Slow Maven downloads | Configure `~/.m2/settings.xml` to use a closer mirror (e.g. the Aliyun mirror) |
+
+---
+
+## 10. Known Issues & TODO
+
+Findings from a code review of the current `main`. Items are grouped by impact; tick them off as fixes land.
+
+### 10.1 🔴 Money safety (fix first)
+
+- [ ] **Reject non-positive amounts everywhere.** `RefundRequest.amount` is only checked against the original payment amount, never for `> 0`. Because `Account.freeze` / `debit` / `credit` also accept negative values, a refund with `amount = -X` on any `COMPLETED` payment moves `X` from the payer to the payee and can drive the payer's balance negative. Add `@Positive` validation on request DTOs and guard every `Account` balance method. (`RefundService`, `PaymentController`, `Account`)
+- [ ] **Stop exposing internal money-moving endpoints through the gateway.** `/api/v1/accounts/**` and `/api/v1/ledger/**` are routed publicly, including `freeze`, `unfreeze`, `transfer` and ledger entry creation/reversal, and JWT is disabled by default with no role checks when enabled. Anyone can freeze and transfer funds out of any account. Route only read endpoints externally and keep mutations service-to-service. (`gateway-service/src/main/resources/application.yml`)
+- [ ] **Cap cumulative partial refunds.** Each refund is validated in isolation, so refunding 60 twice on a 100 payment succeeds. Several partial refunds that add up to the full amount also never move the payment to `REFUNDED`. Validate against the sum of completed and in-flight refunds. (`RefundService`)
+- [ ] **Fix the refund Saga's post-transfer compensation.** If `transfer` succeeds and the ledger entry then fails, compensation only calls `unfreezeAmount`. The frozen funds were already debited, so the unfreeze fails (its error is swallowed) and the refund is marked `FAILED` with money moved and no ledger record. The whole Saga also runs inside one `@Transactional` method, so a failed final save rolls back the refund row after funds have moved. (`RefundService`)
+
+### 10.2 🟠 Functional bugs
+
+- [ ] **Risk-rejected orders are rolled back and lock the idempotency key.** `RiskCheckStep` saves `REJECTED` and then throws inside the `@Transactional` `createPayment`, so the whole transaction rolls back and the `REJECTED` order is never persisted. `OrderPersistStep` has already written the payment ID to Redis, though, so every retry with the same `Idempotency-Key` returns 409 "original order not found" for 24 hours. The same happens for any exception raised after `OrderPersistStep`. (`RiskCheckStep`, `OrderPersistStep`, `PaymentService`)
+- [ ] **`GET /api/v1/ledger/verify` always returns `false`.** The sum queries filter on `entryType = 'DEBIT'` / `'CREDIT'`, but entries are written as `PAYMENT` / `REVERSAL`, so both sums are `null`. Because each row already carries both sides, a global debit = credit check is tautological anyway. Verify per account or per payment (e.g. `PAYMENT` minus `REVERSAL`) instead. (`LedgerEntryRepository`, `LedgerService`)
+- [ ] **Failure webhooks are never delivered.** The `payment.failed` event has no `callback_url`, so notification-service skips it. `Map.of` also throws `NullPointerException` when `reason` is `null`. (`PaymentEventProducer.sendPaymentFailed`)
+
+### 10.3 🟡 Reliability & engineering
+
+- [ ] **Make account and ledger operations idempotent, and configure timeouts explicitly.** No Resilience4j `TimeLimiter` is configured. If the Spring Cloud CircuitBreaker default (1s) applies, a slow call is reported as `SERVICE_UNAVAILABLE` while it may still succeed on the server, and the retry or compensation that follows acts on the wrong assumption (double freeze or transfer, duplicate ledger rows). Pass an idempotency key (e.g. `paymentId` + operation) to account-service and ledger-service, back it with a unique constraint, and set explicit timeouts.
+- [ ] **Hand off to async processing only after commit.** The async trigger (Kafka `payment.created` publish, or Temporal workflow start once #11 lands) fires inside the `createPayment` transaction. The consumer can read the order before it is committed, and if the transaction rolls back the async flow still runs for an order that does not exist. Use `TransactionSynchronization.afterCommit` or an outbox table.
+- [ ] **Harden notification-service.** `callback_url` is user-supplied and `/api/v1/notify/webhook` is public, so the service can be made to POST to any internal address (SSRF). Allow-list schemes and hosts and block private ranges. Webhook retries also sleep inside the Kafka consume loop, so one slow endpoint stalls a whole topic for tens of seconds. Move delivery to a worker pool or a retry topic.
+- [ ] **Generate the frontend `Idempotency-Key` once per submission.** `api/payment.ts` creates a new key on every call, so a retry after a network timeout becomes a second payment. Create the key when the form is submitted and reuse it for retries of that submission.
+- [ ] **Don't count business errors as service failures.** `FallbackPolicy` rethrows 4xx responses unchanged, but the circuit breaker still records them as failures. With a window of 10 and a 50% threshold, a burst of insufficient-balance rejections can open the account-service circuit for every caller for 30s. Record only 5xx, network errors and timeouts. Once #11 lands, also mark 4xx errors non-retryable in the Temporal activity options. (`payment-service/src/main/resources/application.yml`)
+- [ ] **Add tests.** CI runs `mvn -B clean verify`, but there are no test sources. Start with `Account` balance arithmetic, the `PaymentStatus` state machine, `RefundService` validation, and the payment Saga's compensation paths.
