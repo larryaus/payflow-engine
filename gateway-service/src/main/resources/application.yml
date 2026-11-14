@@ -13,6 +13,9 @@ spring:
             redis-rate-limiter.burstCapacity: 20
             redis-rate-limiter.requestedTokens: 1
             key-resolver: "#{@ipKeyResolver}"
+      # account / ledger / notification are internal services: only their read endpoints (GET/HEAD) are routed.
+      # Money-moving calls (freeze, unfreeze, transfer, ledger entries) and the webhook trigger are
+      # service-to-service only; a request with another method matches no route and gets 404.
       routes:
         - id: payment-service
           uri: ${SERVICES_PAYMENT_URL:http://localhost:8081}
@@ -26,10 +29,12 @@ spring:
           uri: ${SERVICES_ACCOUNT_URL:http://localhost:8082}
           predicates:
             - Path=/api/v1/accounts/**
+            - Method=GET,HEAD
         - id: ledger-service
           uri: ${SERVICES_LEDGER_URL:http://localhost:8083}
           predicates:
             - Path=/api/v1/ledger/**
+            - Method=GET,HEAD
         - id: risk-service
           uri: ${SERVICES_RISK_URL:http://localhost:8084}
           predicates:
@@ -38,6 +43,7 @@ spring:
           uri: ${SERVICES_NOTIFICATION_URL:http://localhost:8085}
           predicates:
             - Path=/api/v1/notify/**
+            - Method=GET,HEAD
   data:
     redis:
       host: ${SPRING_REDIS_HOST:localhost}

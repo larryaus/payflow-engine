@@ -59,6 +59,13 @@ public class IdempotencyFilter {
     }
 
     /**
+     * 释放占位 — 请求在落库前失败时调用，让客户端可以用同一个 key 重试
+     */
+    public void release(String idempotencyKey) {
+        redisTemplate.delete(KEY_PREFIX + idempotencyKey);
+    }
+
+    /**
      * 兼容旧接口 — 等同于 !tryAcquire()
      */
     public boolean isDuplicate(String idempotencyKey) {

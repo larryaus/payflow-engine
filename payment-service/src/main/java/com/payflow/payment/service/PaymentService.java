@@ -96,8 +96,10 @@ public class PaymentService {
                 throw new PaymentException("ACCOUNT_BUSY", "账户繁忙,请稍后重试");
             }
 
+            // save() merges the detached order and returns the copy carrying the new @Version;
+            // keep using that copy, or the next save fails the optimistic-lock check.
             order.transitTo(PaymentStatus.PROCESSING);
-            paymentOrderRepository.save(order);
+            order = paymentOrderRepository.save(order);
 
             accountClient.freezeAmount(order.getFromAccount(), order.getAmount());
             froze = true;
@@ -116,7 +118,7 @@ public class PaymentService {
                     "from=" + order.getFromAccount() + " to=" + order.getToAccount() + " amount=" + order.getAmount(), "SUCCESS", null);
 
             order.transitTo(PaymentStatus.COMPLETED);
-            paymentOrderRepository.save(order);
+            order = paymentOrderRepository.save(order);
             eventProducer.sendPaymentCompleted(order);
             auditService.log("PAYMENT_COMPLETED", "PAYMENT", paymentId, null, "SUCCESS", null);
 
@@ -222,7 +224,7 @@ public class PaymentService {
         log.error("Payment {} failed: {}", order.getPaymentId(), reason);
         order.transitTo(PaymentStatus.FAILED);
         order.setUpdatedAt(Instant.now());
-        paymentOrderRepository.save(order);
+        order = paymentOrderRepository.save(order);
         eventProducer.sendPaymentFailed(order, reason);
         auditService.log("PAYMENT_FAILED", "PAYMENT", order.getPaymentId(), reason, "FAILED", null);
     }

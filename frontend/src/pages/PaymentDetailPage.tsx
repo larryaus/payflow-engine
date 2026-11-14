@@ -56,6 +56,12 @@ function PaymentDetailPage() {
   if (loading) return <Spin size="large" style={{ display: 'block', margin: '100px auto' }} />;
   if (!order) return <div>支付单不存在</div>;
 
+  // 与后端一致: 可退金额 = 原金额 − 处理中和已完成的退款
+  const refundable =
+    order.amount -
+    refunds
+      .filter((r) => r.status === 'PROCESSING' || r.status === 'COMPLETED')
+      .reduce((sum, r) => sum + r.amount, 0);
   const currentStep = statusSteps.indexOf(order.status);
   const isFailed = order.status === 'FAILED' || order.status === 'REJECTED';
 
@@ -78,7 +84,7 @@ function PaymentDetailPage() {
       <Card
         title="支付详情"
         extra={
-          order.status === 'COMPLETED' && (
+          order.status === 'COMPLETED' && refundable > 0 && (
             <Button danger onClick={() => setRefundVisible(true)}>
               发起退款
             </Button>
@@ -146,16 +152,17 @@ function PaymentDetailPage() {
         title="发起退款"
         open={refundVisible}
         onOk={handleRefund}
+        okButtonProps={{ disabled: refundAmount <= 0 || Math.round(refundAmount * 100) > refundable }}
         onCancel={() => setRefundVisible(false)}
         okText="确认退款"
         cancelText="取消"
       >
         <div style={{ marginBottom: 16 }}>
-          <label>退款金额 (元，最多 {formatAmount(order.amount)})</label>
+          <label>退款金额 (元，最多 {formatAmount(refundable)})</label>
           <InputNumber
             style={{ width: '100%', marginTop: 8 }}
             min={0.01}
-            max={order.amount / 100}
+            max={refundable / 100}
             precision={2}
             value={refundAmount}
             onChange={(v) => setRefundAmount(v || 0)}

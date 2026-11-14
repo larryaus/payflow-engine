@@ -22,6 +22,8 @@ Seven services communicate via REST (sync) and Kafka (async):
 
 **Infrastructure:** PostgreSQL 16, Redis 7, Kafka (Confluent 7.6 — KRaft mode, no ZooKeeper), Nginx
 
+**Internal endpoints:** The gateway routes only `GET`/`HEAD` to `account-service`, `ledger-service` and `notification-service` (`Method=GET,HEAD` predicate). Money-moving calls (`freeze` / `unfreeze` / `transfer`, ledger entry create/reverse) and the webhook trigger are service-to-service only and return 404 through the gateway. `GatewayRoutesTest` guards this.
+
 **Rate limiting:** Gateway service (`gateway-service`) — Redis token bucket via Spring Cloud Gateway `RequestRateLimiter` filter, 10r/s per IP, burst capacity 20, key resolved from `X-Forwarded-For` / `X-Real-IP` / remote address.
 
 **Authentication:** Gateway service validates JWT tokens on all routes except whitelisted paths (`/actuator/**`, health endpoints). Valid tokens produce `X-Auth-User` and `X-Auth-Roles` headers forwarded to downstream services. **Default is `JWT_ENABLED=false`** — both the gateway's standalone default (`application.yml`) and `docker-compose.yml` ship with JWT disabled because the frontend has no login flow. Set `JWT_ENABLED=true` to require Bearer tokens.
@@ -44,6 +46,7 @@ Seven services communicate via REST (sync) and Kafka (async):
 ```
 Client → Nginx → Gateway Service (JWT auth, rate limit, trace ID)
        → Payment Service
+       → RequestValidationStep (amount > 0, CNY only, from != to, required fields, column lengths → 400)
        → IdempotencyStep  (Redis SETNX, 24h TTL; short-circuit on duplicate)
        → OrderPersistStep (create PaymentOrder, status=CREATED)
        → RiskCheckStep    (sync Feign → Risk Service; PASS→PENDING, FAIL→REJECTED+exception)
@@ -55,7 +58,7 @@ Client → Nginx → Gateway Service (JWT auth, rate limit, trace ID)
 ```
 Kafka consumer (payment.created)
        → If order.status != PENDING → skip (Kafka redelivery dedupe)
-       → Acquire Redisson lock on fromAccount (tryLock 5s, hold max 30s)
+       → Acquire Redisson lock on fromAccount (tryLock 5s, hold max 30s; not acquired → PENDING → FAILED)
        → status → PROCESSING
        → Account Service: freeze amount        (audit: FREEZE_AMOUNT)
        → Ledger Service:  create double-entry  (audit: CREATE_LEDGER_ENTRY)
@@ -90,7 +93,7 @@ payflow-engine/
 │       ├── controller/       # REST endpoints + request record DTOs
 │       ├── service/          # PaymentService, RefundService
 │       │   └── pipeline/     # PaymentCreationPipeline + steps
-│       │       └── step/     # IdempotencyStep, OrderPersistStep, RiskCheckStep, EventPublishStep
+│       │       └── step/     # RequestValidationStep, IdempotencyStep, OrderPersistStep, RiskCheckStep, EventPublishStep
 │       ├── dto/              # Response DTOs (CreatePaymentResponse, PaymentResponse, etc.)
 │       ├── domain/           # JPA entities + state machine (PaymentStatus, RefundStatus)
 │       ├── repository/       # Spring Data JPA repos
@@ -109,7 +112,7 @@ payflow-engine/
 │       ├── domain/           # Account.java (@Version optimistic locking)
 │       ├── repository/       # AccountRepository
 │       ├── config/           # TraceFilter
-│       └── exception/        # GlobalExceptionHandler (incl. 409 OptimisticLockException)
+│       └── exception/        # GlobalExceptionHandler (409 OptimisticLockException, 400 InvalidAmountException)
 │   └── src/main/resources/
 │       ├── application.yml   # Actuator config
 │       └── logback-spring.xml
@@ -119,6 +122,7 @@ payflow-engine/
 │       ├── service/          # LedgerService (createEntry, reverseEntry, verifyBalance)
 │       ├── domain/           # LedgerEntry
 │       ├── config/           # TraceFilter
+│       ├── exception/        # GlobalExceptionHandler (IllegalArgumentException → 400)
 │       └── repository/       # LedgerEntryRepository
 │   └── src/main/resources/
 │       ├── application.yml   # Actuator config
@@ -213,6 +217,8 @@ mvn clean package           # Build JAR
 mvn -B clean verify         # Full build + tests (CI command)
 ```
 
+Unit tests need no PostgreSQL, Redis or Kafka (CI provides none): `AccountTest`, `LedgerServiceTest`, `PaymentStatusTest`, `RequestValidationStepTest`, `PaymentServiceTest` (Saga paths, with an in-memory repository that enforces `@Version` like a JPA merge), `RefundServiceTest`, and `GatewayRoutesTest` (stub backend; the rate limiter fails open without Redis).
+
 **Frontend:**
 ```bash
 npm run build   # TypeScript check + Vite production build
@@ -233,8 +239,9 @@ go build ./...
 
 - **Package structure:** `com.payflow.<service>.<layer>` — always follow controller → service → repository layering
 - **Naming:** PascalCase classes, camelCase methods, UPPER_SNAKE_CASE enum values
-- **Amounts:** Always use `BIGINT` (cents/smallest currency unit) — never floating-point for money
+- **Amounts:** Always use `BIGINT` (cents/smallest currency unit) — never floating-point for money. Amounts must be **positive**: `RequestValidationStep` and `RefundService` reject `≤ 0` with 400, and `Account` balance methods (`InvalidAmountException` → 400) and `LedgerService` (`IllegalArgumentException` → 400) guard again. Only CNY is accepted until currency conversion exists.
 - **Optimistic locking:** Both `Account` and `PaymentOrder` carry JPA `@Version`. **Do not initialize the version field** (leave it `null`) — Spring Data treats a non-null `@Version` as "not new" and routes `save()` to `merge()`, which on a null id triggers a duplicate-insert. The DB column has `DEFAULT 0`.
+- **Saving detached entities:** Outside a transaction (e.g. `processPaymentAsync`), `save()` merges and returns a **new** instance carrying the incremented `@Version`. Always reassign — `order = repository.save(order)` — or the next save of the stale instance fails the optimistic-lock check.
 - **Optimistic-lock retries:** `AccountService` wraps `freeze` / `unfreeze` / `transfer` in `TransactionTemplate.executeWithoutResult` and retries up to 3 times on `ObjectOptimisticLockingFailureException` — each retry runs in a fresh transaction. `GlobalExceptionHandler` (account + payment) maps the exception to **409 Conflict**.
 - **Idempotency:** `IdempotencyFilter` / `IdempotencyStep` uses Redis SETNX with 24h TTL — payment endpoints are protected automatically
 - **Distributed locks:** Use Redisson (not raw Redis) for account-level operations — `tryLock(5, 30, TimeUnit.SECONDS)`
@@ -255,8 +262,10 @@ go build ./...
 Payment creation is orchestrated by `PaymentCreationPipeline` which runs steps in order. Any step can set `ctx.shortCircuit()` to skip remaining steps:
 
 ```
-IdempotencyStep → OrderPersistStep → RiskCheckStep → EventPublishStep
+RequestValidationStep → IdempotencyStep → OrderPersistStep → RiskCheckStep → EventPublishStep
 ```
+
+Validation runs first so an invalid request never reserves its `Idempotency-Key` (a reserved key that never gets an order is stuck for 24h).
 
 Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting into the pipeline constructor in order.
 
@@ -267,7 +276,19 @@ Add new pre-acceptance steps by implementing `PaymentCreationStep` and injecting
 - **Pre-transfer failure** (`transferred=false`): `compensate()` reverses in reverse order — ledger reversal first (if created), then unfreeze (if frozen). Each compensation step has its own try-catch so one failure does not abort the rest. The order is then transitioned to `FAILED` and `payment.failed` is published.
 - **Post-transfer failure** (`transferred=true`, but the subsequent DB save / event publish failed): money has already moved — **never compensate**. Audit `RECONCILE_REQUIRED`, then `tryFinalizeCompleted()` re-reads the order in a fresh fetch and best-effort transitions it to `COMPLETED`. A missed finalization is left to the reconciliation job, never to compensation.
 
+If the account lock cannot be acquired, nothing was frozen: the order goes `PENDING → FAILED` directly.
+
 This split exists because earlier code ran `compensate()` from any catch block, so a post-transfer save failure would reverse the ledger and try to unfreeze a now-empty frozen balance, leaving books inconsistent.
+
+### Refunds
+
+`RefundService.createRefund` holds `refund:lock:{paymentId}` from validation until the final state is committed, and splits the work into two local transactions around a Saga with no DB transaction open:
+
+1. **reserve** — payment must be `COMPLETED`; `amount ≤ payment.amount − Σ(PROCESSING + COMPLETED refunds)`; insert the refund as `PROCESSING` and commit, so concurrent and later requests see the reservation.
+2. **Saga** — `freeze(payee) → ledger createEntry → transfer(payee → payer)`, same order as payments so money moves last. A failure before the transfer completes runs `reverseEntry` (if created) then `unfreezeAmount` (if frozen), each in its own try-catch.
+3. **finish** — mark `COMPLETED` / `FAILED`; when completed refunds sum to the payment amount, `COMPLETED → REFUNDED`.
+
+The refund `Idempotency-Key` is released (`IdempotencyFilter.release`) when the request fails before step 1 commits. Never call remote services inside a `@Transactional` method here — the DB transaction would roll back after money has moved.
 
 ### TypeScript / React (Frontend)
 
@@ -334,7 +355,7 @@ Every financial movement creates a pair of ledger entries (debit account + credi
 `PaymentStatus` transitions are strictly enforced via `canTransitTo()`:
 ```
 CREATED → PENDING (risk pass) | REJECTED (risk fail)
-PENDING → PROCESSING | REJECTED
+PENDING → PROCESSING | REJECTED | FAILED (async processing gave up before freezing, e.g. account lock busy)
 PROCESSING → COMPLETED | FAILED
 COMPLETED → REFUNDED
 FAILED / REJECTED / REFUNDED → (terminal, no transitions)
@@ -357,10 +378,10 @@ A single `X-Trace-Id` flows through every hop: gateway → Java filter (MDC) →
 ### Gateway Service (port 8080)
 All client requests should go through the gateway. It routes by path prefix:
 - `/api/v1/payments/**` → payment-service (8081)
-- `/api/v1/accounts/**` → account-service (8082)
-- `/api/v1/ledger/**` → ledger-service (8083)
+- `/api/v1/accounts/**` → account-service (8082) — `GET`/`HEAD` only
+- `/api/v1/ledger/**` → ledger-service (8083) — `GET`/`HEAD` only
 - `/api/v1/risk/**` → risk-service (8084)
-- `/api/v1/notify/**` → notification-service (8085)
+- `/api/v1/notify/**` → notification-service (8085) — `GET`/`HEAD` only
 
 | Method | Path | Description |
 |---|---|---|

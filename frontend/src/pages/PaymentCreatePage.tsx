@@ -54,13 +54,9 @@ function PaymentCreatePage() {
           />
         </Form.Item>
 
+        {/* 账户余额与账本只记 CNY，后端会拒绝其他币种 */}
         <Form.Item name="currency" label="币种" initialValue="CNY">
-          <Select
-            options={[
-              { value: 'CNY', label: '人民币 (CNY)' },
-              { value: 'USD', label: '美元 (USD)' },
-            ]}
-          />
+          <Select disabled options={[{ value: 'CNY', label: '人民币 (CNY)' }]} />
         </Form.Item>
 
         <Form.Item
