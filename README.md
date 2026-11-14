@@ -88,8 +88,8 @@ Request:
 {
   "from_account": "ACC_001",
   "to_account": "ACC_002",
-  "amount": 10000,           // Unit: cents, avoids floating-point precision issues
-  "currency": "CNY",
+  "amount": 10000,           // Unit: cents, avoids floating-point precision issues; must be > 0
+  "currency": "CNY",         // Optional, defaults to CNY; other currencies are rejected (balances are CNY-only)
   "payment_method": "BANK_TRANSFER",
   "memo": "Payment for goods",
   "callback_url": "https://merchant.com/webhook/payment"
@@ -102,6 +102,8 @@ Response 201 Created:
   "created_at": "2026-03-22T10:00:00Z"
 }
 ```
+
+`RequestValidationStep` runs before the idempotency key is reserved and returns **400** (`INVALID_AMOUNT` / `INVALID_REQUEST`) for a non-positive amount, a currency other than CNY, `from_account == to_account`, missing required fields, or values longer than their columns.
 
 ### 3.2 Get Payment Status
 
@@ -129,7 +131,7 @@ Idempotency-Key: {uuid}
 
 Request:
 {
-  "amount": 5000,              // Partial refunds are supported
+  "amount": 5000,              // Must be > 0; partial refunds are supported
   "reason": "Goods returned"
 }
 
@@ -137,10 +139,12 @@ Response 201 Created:
 {
   "refund_id": "REF_20260322_xyz",
   "payment_id": "PAY_20260322_abcdef",
-  "status": "PROCESSING",
+  "status": "COMPLETED",       // COMPLETED | FAILED (the refund runs synchronously)
   "amount": 5000
 }
 ```
+
+The sum of `PROCESSING` and `COMPLETED` refunds can never exceed the payment amount (**400** `INVALID_AMOUNT` otherwise). When completed refunds add up to the full amount, the payment moves to `REFUNDED`.
 
 ### 3.4 List Refunds
 
@@ -285,6 +289,15 @@ Client             Nginx(frontend)    GatewaySvc      PaymentSvc      RiskSvc   
 
 **Kafka redelivery protection:** On entry, `processPaymentAsync` skips immediately if `status != PENDING` (prevents a double charge when the same offset is replayed after a consumer restart).
 
+**Account lock busy:** if the payer's Redisson lock cannot be acquired within 5s, nothing has been frozen yet, so the order goes straight from `PENDING` to `FAILED` and `payment.failed` is published.
+
+**Refund flow (synchronous, `RefundService`):** the per-payment lock `refund:lock:{paymentId}` is held from validation until the final state is committed, so refunds of one payment run one at a time.
+1. **Reserve** (local transaction): check the payment is `COMPLETED` and the amount fits the refundable balance, insert the refund as `PROCESSING`, commit.
+2. **Saga** (no DB transaction open): `freeze(payee) → ledger entry → transfer(payee → payer)`, the same order as a payment, so money moves last. A failure before the transfer completes reverses the ledger entry (if created) and unfreezes (if frozen).
+3. **Finish** (local transaction): mark the refund `COMPLETED` / `FAILED`; if completed refunds now equal the payment amount, move the payment to `REFUNDED`.
+
+The refund's `Idempotency-Key` is released if the request fails before step 1 commits, so the client can retry with the same key.
+
 ### 4.1 Payment State Machine
 
 ```
@@ -297,6 +310,7 @@ Client             Nginx(frontend)    GatewaySvc      PaymentSvc      RiskSvc   
                 │ PENDING  │───────────────────────>│ REJECTED │
                 └────┬─────┘                        └──────────┘
       (CREATED can also → REJECTED)
+      (PENDING → FAILED when async processing gives up before freezing, e.g. account lock busy)
                      │ triggered by Kafka consumer
                      ▼
                 ┌──────────────┐
@@ -375,6 +389,8 @@ spring:
             redis-rate-limiter.requestedTokens: 1     # Each request consumes 1 token
             key-resolver: "#{@ipKeyResolver}"         # Rate limit by client IP
 ```
+
+**Only read endpoints of internal services are routed.** The `account-service`, `ledger-service` and `notification-service` routes carry a `Method=GET,HEAD` predicate, so `freeze` / `unfreeze` / `transfer`, ledger entry creation/reversal and the webhook trigger are reachable only service-to-service; through the gateway they return 404.
 
 - **replenishRate=10**: at most 10 requests per second per client IP
 - **burstCapacity=20**: allows an instantaneous burst of 20 requests; anything beyond returns 429
@@ -614,12 +630,13 @@ payflow-engine/
 │       │   └── PaymentController.java          # REST API entry point (incl. request record DTOs)
 │       ├── service/
 │       │   ├── PaymentService.java             # Payment orchestration (main flow + async processing + Saga compensation)
-│       │   ├── RefundService.java              # Refund logic
+│       │   ├── RefundService.java              # Refund saga (lock held until commit, cumulative refund cap)
 │       │   └── pipeline/
 │       │       ├── PaymentCreationPipeline.java # Pipeline orchestrator
 │       │       ├── PaymentCreationContext.java  # Pipeline context (incl. shortCircuit)
 │       │       ├── PaymentCreationStep.java     # Step interface
 │       │       └── step/
+│       │           ├── RequestValidationStep.java # Step 0: input validation (before the idempotency key)
 │       │           ├── IdempotencyStep.java     # Step 1: idempotency reservation
 │       │           ├── OrderPersistStep.java    # Step 2: order persistence
 │       │           ├── RiskCheckStep.java       # Step 3: risk check
@@ -677,12 +694,13 @@ payflow-engine/
 │       ├── service/
 │       │   └── AccountService.java             # TransactionTemplate + optimistic-lock retry (3 attempts)
 │       ├── domain/
-│       │   └── Account.java                    # @Version optimistic lock
+│       │   └── Account.java                    # @Version optimistic lock; balance ops reject amounts ≤ 0
 │       ├── config/
 │       │   └── TraceFilter.java                # Inbound X-Trace-Id → MDC
 │       ├── repository/
 │       │   └── AccountRepository.java
 │       └── exception/
+│           ├── InvalidAmountException.java     # → 400 INVALID_AMOUNT
 │           └── GlobalExceptionHandler.java     # OptimisticLockException → 409
 │   └── src/main/resources/
 │       ├── application.yml
@@ -701,6 +719,8 @@ payflow-engine/
 │       │   └── LedgerEntry.java
 │       ├── config/
 │       │   └── TraceFilter.java                # Inbound X-Trace-Id → MDC
+│       ├── exception/
+│       │   └── GlobalExceptionHandler.java     # IllegalArgumentException → 400
 │       └── repository/
 │           └── LedgerEntryRepository.java
 │   └── src/main/resources/

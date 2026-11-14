@@ -1,5 +1,6 @@
 package com.payflow.account.domain;
 
+import com.payflow.account.exception.InvalidAmountException;
 import jakarta.persistence.*;
 import java.time.Instant;
 
@@ -29,8 +30,9 @@ public class Account {
     @Column(nullable = false)
     private String status = "ACTIVE";
 
+    // 不要初始化: 非 null 的 @Version 会让 Spring Data 把新实体当成已存在, save() 走 merge
     @Version
-    private Long version = 0L;
+    private Long version;
 
     @Column(name = "created_at", nullable = false)
     private Instant createdAt = Instant.now();
@@ -51,6 +53,7 @@ public class Account {
 
     /** 冻结金额: 从可用余额转移到冻结余额 */
     public void freeze(Long amount) {
+        requirePositive(amount);
         if (availableBalance < amount) {
             throw new IllegalStateException("Insufficient available balance for freeze");
         }
@@ -61,6 +64,7 @@ public class Account {
 
     /** 解冻金额: 从冻结余额转回可用余额 */
     public void unfreeze(Long amount) {
+        requirePositive(amount);
         if (frozenBalance < amount) {
             throw new IllegalStateException("Insufficient frozen balance for unfreeze");
         }
@@ -71,6 +75,7 @@ public class Account {
 
     /** 扣款: 从冻结余额中扣除(已冻结的资金) */
     public void debit(Long amount) {
+        requirePositive(amount);
         if (frozenBalance < amount) {
             throw new IllegalStateException("Insufficient frozen balance for debit");
         }
@@ -80,7 +85,15 @@ public class Account {
 
     /** 入账: 增加可用余额 */
     public void credit(Long amount) {
+        requirePositive(amount);
         this.availableBalance += amount;
         this.updatedAt = Instant.now();
+    }
+
+    /** 所有余额操作只接受正数 — 负数会把冻结/扣款/入账变成反向资金流动 */
+    private static void requirePositive(Long amount) {
+        if (amount == null || amount <= 0) {
+            throw new InvalidAmountException("Amount must be a positive number of cents: " + amount);
+        }
     }
 }

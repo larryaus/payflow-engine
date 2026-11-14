@@ -24,6 +24,7 @@ public class LedgerService {
     @Transactional
     public LedgerEntry createEntry(String referenceId, String debitAccount,
                                     String creditAccount, Long amount) {
+        validate(debitAccount, creditAccount, amount);
         LedgerEntry entry = new LedgerEntry();
         entry.setEntryId("LED_" + UUID.randomUUID().toString().substring(0, 12));
         entry.setPaymentId(referenceId);
@@ -38,6 +39,7 @@ public class LedgerService {
     @Transactional
     public LedgerEntry reverseEntry(String originalReferenceId, String debitAccount,
                                      String creditAccount, Long amount) {
+        validate(debitAccount, creditAccount, amount);
         LedgerEntry reversal = new LedgerEntry();
         reversal.setEntryId("LED_REV_" + UUID.randomUUID().toString().substring(0, 12));
         reversal.setPaymentId("REVERSAL_" + originalReferenceId);
@@ -60,5 +62,15 @@ public class LedgerService {
         Long totalDebit = repository.sumAllDebits();
         Long totalCredit = repository.sumAllCredits();
         return totalDebit != null && totalDebit.equals(totalCredit);
+    }
+
+    /** 分录金额必须为正, 借贷双方必须不同 — 负数分录会让借贷方向反转 */
+    private static void validate(String debitAccount, String creditAccount, Long amount) {
+        if (amount == null || amount <= 0) {
+            throw new IllegalArgumentException("Amount must be a positive number of cents: " + amount);
+        }
+        if (debitAccount.equals(creditAccount)) {
+            throw new IllegalArgumentException("Debit and credit account must differ");
+        }
     }
 }

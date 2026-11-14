@@ -17,6 +17,12 @@ public class GlobalExceptionHandler {
                 .body(Map.of("error_code", "NOT_FOUND", "message", e.getMessage()));
     }
 
+    @ExceptionHandler(InvalidAmountException.class)
+    public ResponseEntity<Map<String, String>> handleInvalidAmount(InvalidAmountException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(Map.of("error_code", "INVALID_AMOUNT", "message", e.getMessage()));
+    }
+
     @ExceptionHandler(IllegalStateException.class)
     public ResponseEntity<Map<String, String>> handleInvalidState(IllegalStateException e) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)

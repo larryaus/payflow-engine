@@ -22,8 +22,8 @@ public class GlobalExceptionHandler {
         HttpStatus status = switch (e.getErrorCode()) {
             case "NOT_FOUND" -> HttpStatus.NOT_FOUND;
             case "IDEMPOTENCY_CONFLICT" -> HttpStatus.CONFLICT;
-            case "RISK_REJECTED", "INVALID_STATUS", "INVALID_AMOUNT" -> HttpStatus.BAD_REQUEST;
-            case "ACCOUNT_BUSY" -> HttpStatus.TOO_MANY_REQUESTS;
+            case "RISK_REJECTED", "INVALID_STATUS", "INVALID_AMOUNT", "INVALID_REQUEST" -> HttpStatus.BAD_REQUEST;
+            case "ACCOUNT_BUSY", "PAYMENT_BUSY" -> HttpStatus.TOO_MANY_REQUESTS;
             default -> HttpStatus.INTERNAL_SERVER_ERROR;
         };
 
